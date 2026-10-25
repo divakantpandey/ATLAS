@@ -1232,88 +1232,14 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 
 		switch parsed.Type {
 		case "done":
-			// The four honesty gates (see runState.exitGates): a done that
-			// the run's own evidence contradicts is bounced, capped.
-			if gate, rejection := st.exitGates(ctx, userMessage, parsed.Summary); gate != "" {
-				st.bounce(ctx, gate, rejection)
-				continue
+			if loop.endOnDone(turn, parsed) {
+				return nil
 			}
-			// A model saying it is finished is a claim, not a demonstration.
-			// The decision comes FIRST, because it decides whose words the
-			// user reads: the model's account is only repeated where the
-			// exact-hash gate authorised the completion it describes.
-			status, reason := finalizeCompletion(ctx, st, userMessage, "")
-			if reason == "unresolved_mutation_debt" {
-				if msg := offerDebtRecovery(ctx, st); msg != "" {
-					st.bounce(ctx, "done", msg)
-					continue
-				}
-			}
-			summary := modelProseIfAuthorized(status, parsed.Summary)
-			if reason == "unresolved_mutation_debt" {
-				summary = unresolvedDebtSummary(st)
-			}
-			// Past the gates, but the verification gate can be past because
-			// it ran out of bounces rather than because anything verified.
-			if st.verificationDemandedAndUnmet() {
-				log.Printf("[agent] done at turn %d with no passing verification — replacing the summary", turn)
-				summary = unverifiedSummary(st.madeProductiveChange,
-					modelProseIfAuthorized(status, parsed.Summary))
-			}
-			// Same reasoning one gate over: the action gate can be past
-			// because its bounces ran out, not because anything was written.
-			if st.actionDemandedAndUnmet(ctx, userMessage) {
-				log.Printf("[agent] done at turn %d with nothing written — saying so", turn)
-				summary = nothingWrittenSummary(summary)
-			} else {
-				summary = withNoChangeNote(ctx, st, status, summary)
-			}
-			emitTerminal(ctx, st, status, reason, summary+liveBackgroundJobNote(ctx))
-			return nil
 
 		case "text":
-			// `text` is the agent's user-facing chat answer. End the turn
-			// here — the user gets one reply per message they send, and can
-			// follow up to continue. Looping after text caused two failures
-			// in earlier revisions: a trailing role=assistant tripped
-			// llama-server's "prefill incompatible with enable_thinking"
-			// 400, and with a "continue" nudge the model would rabbit-hole
-			// into nonsense tool_calls on conversational input.
-			//
-			// text is otherwise an UNGATED exit, and on action-intent
-			// prompts models abandon work through it ("I will now proceed
-			// to sanitize the credentials" — then session over, zero
-			// edits). So the same gates as done run here,
-			// with the narration as the completion claim. Chat replies
-			// still exit cleanly: wantsStateChange requires action-intent
-			// wording or an opened project, and a chat reply has neither.
-			if gate, rejection := st.exitGates(ctx, userMessage, parsed.Content); gate != "" {
-				st.bounce(ctx, gate, rejection)
-				continue
+			if loop.endOnText(turn, parsed) {
+				return nil
 			}
-			ctx.Stream("text", map[string]string{"content": parsed.Content})
-			textSummary := ""
-			if st.actionDemandedAndUnmet(ctx, userMessage) {
-				log.Printf("[agent] text exit at turn %d with nothing written — saying so", turn)
-				textSummary = nothingWrittenSummary("")
-			}
-			// A text reply carries no file obligation of its own; when the
-			// run also wrote something, or was asked to change something and
-			// did not, the same demonstration is required. Same decision as
-			// the done exit, so the two cannot drift.
-			textStatus, textReason := finalizeCompletion(ctx, st, userMessage, "text_reply")
-			if textReason == "unresolved_mutation_debt" {
-				if msg := offerDebtRecovery(ctx, st); msg != "" {
-					st.bounce(ctx, "text", msg)
-					continue
-				}
-				textSummary = unresolvedDebtSummary(st)
-			}
-			if textSummary == "" {
-				textSummary = withNoChangeNote(ctx, st, textStatus, "")
-			}
-			emitTerminal(ctx, st, textStatus, textReason, textSummary)
-			return nil
 
 		case "tool_call":
 			st.toolsRun++
@@ -4684,6 +4610,100 @@ func logModelTurn(ctx *AgentContext, turn int, parsed ModelResponse, response st
 		// a stable hash correlate two occurrences without reproducing one.
 		log.Printf("[agent] turn=%d EMPTY ARGS — model output %s", turn, safeTextSummary(response))
 	}
+}
+
+// endOnDone answers the model's done. A done that the run's own evidence
+// contradicts is bounced and the turn ends (false); otherwise the run ends with
+// its terminal (true).
+func (loop *agentLoop) endOnDone(turn int, parsed ModelResponse) bool {
+	ctx, st, userMessage := loop.ctx, loop.st, loop.userMessage
+	// The four honesty gates (see runState.exitGates): a done that
+	// the run's own evidence contradicts is bounced, capped.
+	if gate, rejection := st.exitGates(ctx, userMessage, parsed.Summary); gate != "" {
+		st.bounce(ctx, gate, rejection)
+		return false
+	}
+	// A model saying it is finished is a claim, not a demonstration.
+	// The decision comes FIRST, because it decides whose words the
+	// user reads: the model's account is only repeated where the
+	// exact-hash gate authorised the completion it describes.
+	status, reason := finalizeCompletion(ctx, st, userMessage, "")
+	if reason == "unresolved_mutation_debt" {
+		if msg := offerDebtRecovery(ctx, st); msg != "" {
+			st.bounce(ctx, "done", msg)
+			return false
+		}
+	}
+	summary := modelProseIfAuthorized(status, parsed.Summary)
+	if reason == "unresolved_mutation_debt" {
+		summary = unresolvedDebtSummary(st)
+	}
+	// Past the gates, but the verification gate can be past because
+	// it ran out of bounces rather than because anything verified.
+	if st.verificationDemandedAndUnmet() {
+		log.Printf("[agent] done at turn %d with no passing verification — replacing the summary", turn)
+		summary = unverifiedSummary(st.madeProductiveChange,
+			modelProseIfAuthorized(status, parsed.Summary))
+	}
+	// Same reasoning one gate over: the action gate can be past
+	// because its bounces ran out, not because anything was written.
+	if st.actionDemandedAndUnmet(ctx, userMessage) {
+		log.Printf("[agent] done at turn %d with nothing written — saying so", turn)
+		summary = nothingWrittenSummary(summary)
+	} else {
+		summary = withNoChangeNote(ctx, st, status, summary)
+	}
+	emitTerminal(ctx, st, status, reason, summary+liveBackgroundJobNote(ctx))
+	return true
+}
+
+// endOnText answers the model's text reply, the same way endOnDone answers a
+// done: bounced, the turn ends (false); otherwise the run ends with its
+// terminal (true).
+func (loop *agentLoop) endOnText(turn int, parsed ModelResponse) bool {
+	ctx, st, userMessage := loop.ctx, loop.st, loop.userMessage
+	// `text` is the agent's user-facing chat answer. End the turn
+	// here — the user gets one reply per message they send, and can
+	// follow up to continue. Looping after text caused two failures
+	// in earlier revisions: a trailing role=assistant tripped
+	// llama-server's "prefill incompatible with enable_thinking"
+	// 400, and with a "continue" nudge the model would rabbit-hole
+	// into nonsense tool_calls on conversational input.
+	//
+	// text is otherwise an UNGATED exit, and on action-intent
+	// prompts models abandon work through it ("I will now proceed
+	// to sanitize the credentials" — then session over, zero
+	// edits). So the same gates as done run here,
+	// with the narration as the completion claim. Chat replies
+	// still exit cleanly: wantsStateChange requires action-intent
+	// wording or an opened project, and a chat reply has neither.
+	if gate, rejection := st.exitGates(ctx, userMessage, parsed.Content); gate != "" {
+		st.bounce(ctx, gate, rejection)
+		return false
+	}
+	ctx.Stream("text", map[string]string{"content": parsed.Content})
+	textSummary := ""
+	if st.actionDemandedAndUnmet(ctx, userMessage) {
+		log.Printf("[agent] text exit at turn %d with nothing written — saying so", turn)
+		textSummary = nothingWrittenSummary("")
+	}
+	// A text reply carries no file obligation of its own; when the
+	// run also wrote something, or was asked to change something and
+	// did not, the same demonstration is required. Same decision as
+	// the done exit, so the two cannot drift.
+	textStatus, textReason := finalizeCompletion(ctx, st, userMessage, "text_reply")
+	if textReason == "unresolved_mutation_debt" {
+		if msg := offerDebtRecovery(ctx, st); msg != "" {
+			st.bounce(ctx, "text", msg)
+			return false
+		}
+		textSummary = unresolvedDebtSummary(st)
+	}
+	if textSummary == "" {
+		textSummary = withNoChangeNote(ctx, st, textStatus, "")
+	}
+	emitTerminal(ctx, st, textStatus, textReason, textSummary)
+	return true
 }
 
 // ---------------------------------------------------------------------------
