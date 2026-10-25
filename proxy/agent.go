@@ -1201,261 +1201,25 @@ func v3DeliveryNudge(ctx *AgentContext, phase string, candidates int, score floa
 }
 
 func runAgentLoop(ctx *AgentContext, userMessage string) error {
-	// One snapshot per validated request, before any turn runs. Only the
-	// immutable inputs: the live decision belongs to the gate records.
-	emitShadowRequestSnapshot(ctx, userMessage)
-	// Capture the human's actual instruction before the loop appends
-	// anything: correctives, manifests and re-injected content all ride
-	// user-role messages, and everything downstream that needs "what was
-	// I asked" (the V3 bridge above all) must not confuse those with this.
-	ctx.HumanTask = userMessage
-	ctx.LiteralBlocks = extractLiteralBlocks(userMessage)
-	// What the user's workspace held before this request: a shell command
-	// that removes one of these files removes the user's work.
-	ctx.InitialWorkspace = snapshotWorkspace(ctx.WorkingDir)
-	if n := len(ctx.LiteralBlocks); n > 0 {
-		log.Printf("[agent] %d literal content contract(s) extracted from the request", n)
-	}
-	// Emit a stage_start envelope so the TUI's pipeline pane shows
-	// the agent is working. Mirrors the typed-event broker.
-	loopStart := time.Now()
-	Emit(NewEnvelope(EvtStageStart, "agent", map[string]interface{}{
-		"detail": fmt.Sprintf("tier=%s msg=%q", ctx.Tier,
-			truncateStr(userMessage, 80)),
-	}))
-	defer func() {
-		// A deletion approval the turn never consumed holds a reference to
-		// the object it was about. The turn is over; let it go.
-		releaseDeleteApproval(ctx)
-		// Close the "agent" stage so the pipeline pane stops showing it
-		// running. Without this, the TUI's pipelineState.apply only ever
-		// sees EvtDone (overall finish) and the agent row is stuck in
-		// Running() forever — visually misleading after the turn ended.
-		dur := time.Since(loopStart).Milliseconds()
-		// The broker said "success": true on every terminal, including every
-		// stop. It now reports the session's actual outcome, from the same
-		// field the SSE terminal used, so the two streams cannot disagree.
-		// `success` keeps its key and its type for existing readers.
-		status := ctx.TerminalStatus
-		if !status.Classified() {
-			status = TerminalIncomplete
-		}
-		Emit(Envelope{
-			EventID:    NewEventID(),
-			Timestamp:  float64(time.Now().UnixNano()) / 1e9,
-			Type:       EvtStageEnd,
-			Stage:      "agent",
-			DurationMS: dur,
-			Payload: map[string]interface{}{
-				"success":       status.Completed(),
-				"status":        string(status),
-				"reason":        ctx.TerminalReason,
-				"total_tokens":  ctx.TotalTokens,
-				"fenced_calls":  ctx.FencedCalls,
-				"fenced_tokens": ctx.FencedTokens,
-			},
-		})
-		donePayload := map[string]interface{}{
-			"success":           status.Completed(),
-			"status":            string(status),
-			"reason":            ctx.TerminalReason,
-			"total_duration_ms": dur,
-			"total_tokens":      ctx.TotalTokens,
-			"fenced_calls":      ctx.FencedCalls,
-			"fenced_tokens":     ctx.FencedTokens,
-		}
-		if ctx.TerminalUnresolved != "" {
-			donePayload["unresolved"] = ctx.TerminalUnresolved
-		}
-		Emit(Envelope{
-			EventID:    NewEventID(),
-			Timestamp:  float64(time.Now().UnixNano()) / 1e9,
-			Type:       EvtDone,
-			Stage:      "agent",
-			DurationMS: dur,
-			Payload:    donePayload,
-		})
-	}()
-
-	// Pre-flight plan generation. Runs BEFORE buildSystemPrompt so
-	// the system prompt can reference the planned steps — the model
-	// gets explicit guidance on what to do first instead of having
-	// to infer it from the user message alone. Skipped for trivial
-	// chat / acks where the ~5-15s cost isn't worth it. Failures
-	// degrade silently — the loop runs without adherence gating.
-	if shouldGeneratePlan(ctx, userMessage) {
-		if plan := generatePlan(ctx, userMessage); plan != nil {
-			ctx.Plan = plan
-			log.Printf("[agent] plan: %d steps, verify=%s, score=%.2f",
-				len(plan.Steps), plan.VerifyStep, plan.WinningScore)
-		}
-	}
-
-	// Build system prompt with tool descriptions, project context,
-	// and (when present) the planned steps.
-	systemPrompt := buildSystemPrompt(ctx)
-
-	// Initialize messages: system prompt, then any prior-turn history
-	// the TUI shipped, then the new user message. PriorHistory is
-	// already filtered to role=user|assistant text turns (no tool
-	// calls/results, no system spam) on the TUI side. Without this,
-	// every user message starts a fresh agent loop and the model can't
-	// answer follow-ups like "what did you just delete?".
-	// Refuse to start on a split workspace. The proxy writing to one host
-	// directory while the sandbox that runs commands is bound to another is
-	// invisible to every /health, and the session that follows is worse than
-	// useless: files land, `run_command` reports them missing, and the model
-	// spends its turns concluding its own work does not exist. Cached with a
-	// TTL, so this is one probe per session at most.
-	if problem := verifyWorkspaceAlignment(ctx); problem != "" {
-		log.Printf("[agent] refusing to start — proxy and sandbox workspaces are not aligned")
-		emitTerminal(ctx, nil, TerminalFailed, "workspace_misaligned", problem)
+	loopStart := beginAgentRun(ctx, userMessage)
+	defer endAgentStage(ctx, loopStart)
+	if !openConversation(ctx, userMessage) {
 		return nil
 	}
 
-	ctx.Messages = make([]AgentMessage, 0, 3+len(ctx.PriorHistory))
-	ctx.Messages = append(ctx.Messages, AgentMessage{Role: "system", Content: systemPrompt})
-	ctx.Messages = append(ctx.Messages, ctx.PriorHistory...)
-
-	// GH #39 point 4: auto-inject reachability slice. If the user
-	// message names project symbols (`dashboard`, "the foo function",
-	// foo.bar.baz), pre-load their definitions so the model doesn't
-	// burn agent turns on read_file/list_directory recon. Fail-soft —
-	// no v3-service / no symbols / no project files / network error
-	// all degrade silently to the original message-only flow.
-	if symbols := extractCandidateSymbols(userMessage); len(symbols) > 0 {
-		fileMap := walkPythonFiles(ctx.WorkingDir)
-		if len(fileMap) > 0 {
-			if idx, ok := resolveProjectSymbols(ctx, fileMap, symbols); ok && len(idx.Matched) > 0 {
-				body := formatProjectContextMessage(idx.Matched)
-				// #39 Phase 3: append the call-graph neighborhood v3-service
-				// returned. Empty string when it returned none.
-				body += formatGraphNeighborhood(idx.Graph)
-				if body != "" {
-					// Role MUST be "user" with a "[system note]:" prefix —
-					// Some Jinja chat templates enforce "System message
-					// must be at the beginning" and 500s on any system
-					// role appended mid-conversation. Same convention
-					// the lens-intervention path uses (commit b79b31d).
-					ctx.Messages = append(ctx.Messages, AgentMessage{
-						Role:    "user",
-						Content: "[system note]: " + body,
-					})
-					names := make([]string, 0, len(idx.Matched))
-					for _, m := range idx.Matched {
-						names = append(names, m.Name)
-					}
-					log.Printf("[symbol_index] injected %d snippet(s) for [%s] from %d project files",
-						len(idx.Matched), strings.Join(names, ", "), len(fileMap))
-					ctx.Stream("symbol_index_injected", map[string]interface{}{
-						"matched": names,
-						"n_files": len(fileMap),
-						"skipped": len(idx.Skipped),
-					})
-				}
-			}
-		}
-	}
-
-	ctx.Messages = append(ctx.Messages, AgentMessage{Role: "user", Content: userMessage})
-
-	// Per-session cache scope. llama.cpp's KV slot persists between
-	// requests by default — that's what keepLlamaWarm relies on. But the
-	// slot also persists *across user sessions*, so context from a previous
-	// session's conversation can bias the next session (the
-	// `show_greeting.py` hallucination from the 2026-04-30 snake test was
-	// likely an example). Erase slot 0 at the start of each agent loop call.
-	// llama.cpp re-encodes the system prompt from scratch (~1-2s on a
-	// warm GPU); the per-turn cache benefit within the session is preserved.
-	// Disable with ATLAS_FRESH_SLOT_PER_SESSION=0.
-	if envOr("ATLAS_FRESH_SLOT_PER_SESSION", "1") != "0" && !ctx.DisableFreshSlot {
-		eraseLlamaSlot(ctx)
-	}
-
-	consecutiveReads := 0 // Track consecutive read-only calls
-	consecutiveErrors := 0
-	totalFailures := 0 // Track consecutive tool failures to break error loops
 	// edit_file old_str-mismatch failures per path. A successful read_file
 	// between attempts resets consecutiveErrors/RecentFailurePaths, which
 	// masks the classic read→edit-miss→read loop (smaller models can't
 	// reproduce old_str byte-for-byte). This counter survives interleaved
 	// reads so we can force the structural_edit steer after the second miss.
 	editMissByPath := map[string]int{}
-	repeatDetections := 0 // hard-stop after the 2nd repeated-identical-call detection
-	// Runaway backstop for content-varying write loops (#147 review finding
-	// #14): the content-fingerprint repeat detector, by design, does not
-	// catch a model that rewrites one file with materially different content
-	// every time and never converges. This counts total writes per path and
-	// escalates to the repeat corrective only at a threshold far above any
-	// realistic iteration (polyglot's healthiest run was ~10), so it stops a
-	// true runaway without regressing legitimate iteration.
-	writeCountByPath := map[string]int{}
 	const runawayWriteThreshold = 20
-	// Exit-gate evidence + the shared bounce shape live on runState (see
-	// its field docs); the remaining counters are loop-local.
 	// THE output-obligation decision, made once, from the contract the
 	// request boundary already validated. Nothing the model emits later can
 	// change which source spoke.
 	outputObligation := resolveOutputObligation(ctx, userMessage)
-	st := &runState{
-		expectedOutputs:       outputObligation.Items,
-		outputObligation:      outputObligation,
-		userWantsVerification: isFixIntentMessage(userMessage),
-	}
-	// One-shot: when a loop-stop is about to fire but the task's named
-	// deliverable was never written, steer toward it once instead of
-	// stopping (many hard tasks loop on run_command exploration and
-	// hard-stop without ever reaching the done/text exit where the
-	// expected-output gate lives — observed on sqlite and merge-diff).
-	outputRescueUsed := false
-
-	// Flag whether we've already injected the approaching-budget hint,
-	// so we don't fire it every turn after crossing the threshold.
-	budgetHintFired := false
-
-	// A tool_call is streamed the moment it parses, before permission and
-	// execution, so every early exit between that point and the
-	// tool_result leaves the client holding a call that never resolves —
-	// a spinner with nothing coming. Observed 2026-08-03 on
-	// multiturn_stats: the repetition breaker stopped the session one
-	// line after announcing a call, and the stream carried 12 tool_call
-	// events against 11 tool_result.
-	//
-	// endStream answers the outstanding call before the summary, so the
-	// invariant holds at every exit rather than at each one that
-	// remembered to.
-	endStream := func(status TerminalStatus, reason, summary string) {
-		emitTerminal(ctx, st, status, reason, summary)
-	}
-
-	// Several branches refuse a call before dispatch and continue. Every one of
-	// them is a failed call the model may ignore forever, so each has to reach
-	// the same path-aware accounting an executed failure reaches -- the raw
-	// pre-resolution intent, the canonical target, the counters, and the
-	// bounded failure policy that reads them. Returns true when the caller must
-	// stop; the caller keeps its own diagnostic, which is unchanged.
-	//
-	// A run that ended because the client left or the deadline fired is not a
-	// model repeating itself, and those paths keep their own terminals.
-	accountRefusedCall := func(name string, intent json.RawMessage, rejection, failPath string) bool {
-		if ctx.Ctx != nil && ctx.Ctx.Err() != nil {
-			consecutiveErrors++
-			return false
-		}
-		recordFailedToolCall(ctx, name, intent, rejection)
-		consecutiveErrors++
-		totalFailures++
-		ctx.RecentFailurePaths = appendRecentFailurePath(ctx.RecentFailurePaths, failPath)
-		if !shouldStopForFailures(totalFailures, consecutiveErrors, ctx.RecentFailurePaths) {
-			return false
-		}
-		log.Printf("[agent] breaking at turn %d: %d refused/failed calls, %d consecutive on %q",
-			st.turn, totalFailures, consecutiveErrors, failPath)
-		endStream(TerminalStopped, "repeated_refusal",
-			repeatedRefusalSummary(name, failPath, st.madeProductiveChange)+
-				liveBackgroundJobNote(ctx))
-		return true
-	}
+	loop := newAgentLoop(ctx, userMessage, outputObligation)
+	st := loop.st
 
 	for turn := 0; ctx.MaxTurns <= 0 || turn < ctx.MaxTurns; turn++ {
 		st.turn = turn
@@ -1464,8 +1228,8 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 		// so the hint is mostly dormant unless an operator explicitly
 		// sets ATLAS_MAX_TURNS. T0 still hits a hint at turn 4 if a
 		// conversational request unexpectedly tries to loop.
-		if !budgetHintFired && ctx.MaxTurns > 0 && turn > 0 && turn*5 >= ctx.MaxTurns*4 {
-			budgetHintFired = true
+		if !loop.budgetHintFired && ctx.MaxTurns > 0 && turn > 0 && turn*5 >= ctx.MaxTurns*4 {
+			loop.budgetHintFired = true
 			ctx.Messages = append(ctx.Messages, AgentMessage{
 				Role: "system",
 				Content: fmt.Sprintf(
@@ -1691,9 +1455,9 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 			// Cap parse failures the same way we cap tool failures.
 			// Five identical parse errors in a row is a stuck loop;
 			// bailing keeps us from burning 6 more LLM round-trips.
-			consecutiveErrors++
-			if consecutiveErrors >= 3 {
-				log.Printf("[agent] breaking parse-error loop at turn %d (%d consecutive)", turn, consecutiveErrors)
+			loop.consecutiveErrors++
+			if loop.consecutiveErrors >= 3 {
+				log.Printf("[agent] breaking parse-error loop at turn %d (%d consecutive)", turn, loop.consecutiveErrors)
 				summary := "Stopped after 3 unparseable responses — the model's tool calls keep " +
 					"getting truncated. Try a more targeted request (e.g. 'edit just the " +
 					"@app.route(\"/product\") handler in app.py') so the response stays under the " +
@@ -1734,9 +1498,9 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 					"category": "swallowed_content",
 				})
 				ctx.Messages = append(ctx.Messages, AgentMessage{Role: "user", Content: feedback})
-				consecutiveErrors++
-				if consecutiveErrors >= 3 {
-					log.Printf("[agent] breaking swallowed-content loop at turn %d (%d consecutive)", turn, consecutiveErrors)
+				loop.consecutiveErrors++
+				if loop.consecutiveErrors >= 3 {
+					log.Printf("[agent] breaking swallowed-content loop at turn %d (%d consecutive)", turn, loop.consecutiveErrors)
 					emitTerminal(ctx, st, TerminalStopped, "unusable_model_output",
 						"Stopped: the model's file writes kept ending early on an unescaped double-quote inside the content, three times in a row. Ask again and, for a large HTML/JS file, request that it be built with structural_edit or split across smaller writes."+liveBackgroundJobNote(ctx))
 					return nil
@@ -1753,9 +1517,9 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 					"category": "ambiguous_content",
 				})
 				ctx.Messages = append(ctx.Messages, AgentMessage{Role: "user", Content: feedback})
-				consecutiveErrors++
-				if consecutiveErrors >= 3 {
-					log.Printf("[agent] breaking ambiguous-content loop at turn %d (%d consecutive)", turn, consecutiveErrors)
+				loop.consecutiveErrors++
+				if loop.consecutiveErrors >= 3 {
+					log.Printf("[agent] breaking ambiguous-content loop at turn %d (%d consecutive)", turn, loop.consecutiveErrors)
 					emitTerminal(ctx, st, TerminalStopped, "unusable_model_output",
 						"Stopped: nothing was written for the last three file writes — each one's content was ambiguous (a markdown fence with text around it, or a doubled or lost escape) and was refused rather than guessed at. Ask again."+liveBackgroundJobNote(ctx))
 					return nil
@@ -1934,9 +1698,9 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 						// preflight refuses gets denied every time, and without
 						// accounting it repeats until the turn cap -- measured at
 						// 21 turns with no terminal of ATLAS's own.
-						if stop := accountRefusedCall(parsed.Name, intentArgs,
+						if loop.accountRefusedCall(parsed.Name, intentArgs,
 							denial,
-							workspaceRefusalPath(ctx, parsed.Name, parsed.Args)); stop {
+							workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
 							return 2
 						}
 						// A denied call still produced a result the model reads,
@@ -1988,9 +1752,9 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				if err := json.Unmarshal(parsed.Args, &testParse); err != nil {
 					log.Printf("[agent] truncated args detected for %s at turn %d", parsed.Name, turn)
 					st.bounceToolCall(ctx, parsed.Name, "Your output was truncated — the content is too long for a single tool call. For existing files, use edit_file with small targeted changes (replace specific functions or sections). For new files, keep them under 100 lines per write_file call.")
-					consecutiveErrors++
-					if consecutiveErrors >= 3 {
-						endStream(TerminalStopped, "oversized_tool_content",
+					loop.consecutiveErrors++
+					if loop.consecutiveErrors >= 3 {
+						loop.endStream(TerminalStopped, "oversized_tool_content",
 							"Stopped: content too large for tool calls. Try requesting smaller, targeted changes.")
 						return nil
 					}
@@ -2012,7 +1776,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				// refused the same byte-identical find_file 60 times over its
 				// whole budget, with no intervention, no log line and no
 				// terminal of its own.
-				if accountRefusedCall(parsed.Name, intentArgs, rejection,
+				if loop.accountRefusedCall(parsed.Name, intentArgs, rejection,
 					workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
 					return nil
 				}
@@ -2224,14 +1988,14 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 									// model sends it, and the resolved body is
 									// what made it look different.
 									recordFailedToolCall(ctx, parsed.Name, intentArgs, ferr.Error())
-									consecutiveErrors++
-									totalFailures++
+									loop.consecutiveErrors++
+									loop.totalFailures++
 									failPath := fencedKey(ctx, wfInput.Path)
 									ctx.RecentFailurePaths = appendRecentFailurePath(ctx.RecentFailurePaths, failPath)
-									if shouldStopForFailures(totalFailures, consecutiveErrors, ctx.RecentFailurePaths) {
+									if shouldStopForFailures(loop.totalFailures, loop.consecutiveErrors, ctx.RecentFailurePaths) {
 										log.Printf("[agent] breaking at turn %d: %d refused/failed calls, %d consecutive on %q",
-											turn, totalFailures, consecutiveErrors, failPath)
-										endStream(TerminalStopped, "repeated_refusal",
+											turn, loop.totalFailures, loop.consecutiveErrors, failPath)
+										loop.endStream(TerminalStopped, "repeated_refusal",
 											repeatedRefusalSummary("write_file", wfInput.Path, st.madeProductiveChange)+
 												liveBackgroundJobNote(ctx))
 										return nil
@@ -2318,7 +2082,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 							// refused call. A model that follows it pays
 							// nothing further: the next call is a different
 							// action on the path and clears the state.
-							if accountRefusedCall("write_file", intentArgs, rejection,
+							if loop.accountRefusedCall("write_file", intentArgs, rejection,
 								workspaceRefusalPath(ctx, "write_file", parsed.Args)) {
 								return nil
 							}
@@ -2350,7 +2114,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 							st.bounceToolCall(ctx, "write_file", rejection)
 							// Same shape, same bound as the unread-overwrite
 							// steer above.
-							if accountRefusedCall("write_file", intentArgs, rejection,
+							if loop.accountRefusedCall("write_file", intentArgs, rejection,
 								workspaceRefusalPath(ctx, "write_file", parsed.Args)) {
 								return nil
 							}
@@ -2396,7 +2160,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 						// re-sends it meets the identical-retry refusal and the
 						// failure bounds. Measured: 20 identical re-sends, each
 						// bounced, until the session deadline.
-						if accountRefusedCall(parsed.Name, intentArgs, rejection,
+						if loop.accountRefusedCall(parsed.Name, intentArgs, rejection,
 							workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
 							return nil
 						}
@@ -2414,7 +2178,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 						log.Printf("[agent] rejecting run_command %q: %q",
 							truncateStr(rc.Command, 80), rejection)
 						st.bounceToolCall(ctx, "run_command", rejection)
-						if accountRefusedCall(parsed.Name, intentArgs, rejection,
+						if loop.accountRefusedCall(parsed.Name, intentArgs, rejection,
 							workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
 							return nil
 						}
@@ -2439,7 +2203,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 						log.Printf("[agent] rejecting run_background %q: %q",
 							truncateStr(rb.Command, 80), rejection)
 						st.bounceToolCall(ctx, "run_background", rejection)
-						if accountRefusedCall(parsed.Name, intentArgs, rejection,
+						if loop.accountRefusedCall(parsed.Name, intentArgs, rejection,
 							workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
 							return nil
 						}
@@ -2463,10 +2227,10 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 			runawayWrite := false
 			if parsed.Name == "write_file" {
 				if wp := writeFilePath(parsed.Args); wp != "" {
-					writeCountByPath[wp]++
-					if writeCountByPath[wp] == runawayWriteThreshold {
+					loop.writeCountByPath[wp]++
+					if loop.writeCountByPath[wp] == runawayWriteThreshold {
 						runawayWrite = true
-						log.Printf("[agent] runaway write backstop: %q rewritten %d times — escalating", wp, writeCountByPath[wp])
+						log.Printf("[agent] runaway write backstop: %q rewritten %d times — escalating", wp, loop.writeCountByPath[wp])
 					}
 				}
 			}
@@ -2477,17 +2241,17 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				st.toolBanned[parsed.Name+"\x00"+p] {
 				log.Printf("[agent] turn=%d blocked %s on %s (tool withdrawn for this file)", turn, parsed.Name, p)
 				st.bounceToolCall(ctx, parsed.Name, toolBanNoteFor(ctx, parsed.Name, p))
-				consecutiveErrors++
-				totalFailures++
+				loop.consecutiveErrors++
+				loop.totalFailures++
 				// A bounce off the ban is a failure like any other. This
 				// branch incremented the counters and then continued without
 				// reading them, so the ceiling could not end a session that
 				// only ever bounced here — measured at 19 and 85 bounces.
 				ctx.RecentFailurePaths = appendRecentFailurePath(ctx.RecentFailurePaths, p)
-				if shouldStopForFailures(totalFailures, consecutiveErrors, ctx.RecentFailurePaths) {
+				if shouldStopForFailures(loop.totalFailures, loop.consecutiveErrors, ctx.RecentFailurePaths) {
 					log.Printf("[agent] breaking at turn %d: %d refused/failed calls, %d consecutive on %q",
-						turn, totalFailures, consecutiveErrors, p)
-					endStream(TerminalStopped, "repeated_refusal",
+						turn, loop.totalFailures, loop.consecutiveErrors, p)
+					loop.endStream(TerminalStopped, "repeated_refusal",
 						repeatedRefusalSummary(parsed.Name, p, st.madeProductiveChange)+liveBackgroundJobNote(ctx))
 					return nil
 				}
@@ -2513,7 +2277,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 						if _, already := ev.diagnostics[sha]; already {
 							if msg := rejectedProposalRecovery(ctx, st, rel, canon, sha); msg != "" {
 								st.bounceToolCall(ctx, parsed.Name, msg)
-								if accountRefusedCall(parsed.Name, intentArgs, msg,
+								if loop.accountRefusedCall(parsed.Name, intentArgs, msg,
 									workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
 									return nil
 								}
@@ -2534,7 +2298,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 					// Counted once, here. The call never reaches the tool, so
 					// no post-execution accounting runs for it, and the ban
 					// below is skipped by the continue.
-					if accountRefusedCall(parsed.Name, intentArgs, msg,
+					if loop.accountRefusedCall(parsed.Name, intentArgs, msg,
 						workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
 						return nil
 					}
@@ -2564,18 +2328,18 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				// call running to the turn cap with nothing to stop it — the
 				// refusal returns before both the repetition window and the
 				// error counter, so neither breaker would ever see it.
-				consecutiveErrors++
-				totalFailures++
+				loop.consecutiveErrors++
+				loop.totalFailures++
 				failPath := extractFailurePath(parsed.Name, parsed.Args)
 				ctx.RecentFailurePaths = appendRecentFailurePath(ctx.RecentFailurePaths, failPath)
 				// ...and the same stopping rules have to apply here. Both the
 				// ceiling and the path-aware breaker live inside the
 				// post-execution failure branch, which this path skips, so
 				// incrementing alone left the counters with no reader.
-				if shouldStopForFailures(totalFailures, consecutiveErrors, ctx.RecentFailurePaths) {
+				if shouldStopForFailures(loop.totalFailures, loop.consecutiveErrors, ctx.RecentFailurePaths) {
 					log.Printf("[agent] breaking at turn %d: %d refused/failed calls, %d consecutive on %q",
-						turn, totalFailures, consecutiveErrors, ctx.RecentFailurePaths[len(ctx.RecentFailurePaths)-1])
-					endStream(TerminalStopped, "repeated_refusal",
+						turn, loop.totalFailures, loop.consecutiveErrors, ctx.RecentFailurePaths[len(ctx.RecentFailurePaths)-1])
+					loop.endStream(TerminalStopped, "repeated_refusal",
 						repeatedRefusalSummary(parsed.Name, failPath, st.madeProductiveChange)+liveBackgroundJobNote(ctx))
 					return nil
 				}
@@ -2596,7 +2360,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 					"reason": msg,
 				})
 				pendingRepeatCorrective = msg
-				repeatDetections++
+				loop.repeatDetections++
 				// Steer-before-kill ladder. On the FIRST detection, fall
 				// through: pendingRepeatCorrective is injected below and the
 				// loop continues, so the model gets an explicit nudge to
@@ -2613,14 +2377,14 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				// on disk but unverified. A nudge first is the whole point:
 				// the broken-verify steer (below) can turn exactly these into
 				// completions.
-				if repeatDetections >= 2 {
+				if loop.repeatDetections >= 2 {
 					// Output-rescue: if the task named a deliverable and it
 					// isn't on disk, the model is looping WITHOUT having
 					// committed its answer — steer toward the file once and
 					// keep going rather than hard-stopping empty-handed.
-					if missing := missingExpectedOutputs(ctx, st.expectedOutputs); len(missing) > 0 && !outputRescueUsed {
-						outputRescueUsed = true
-						repeatDetections = 0
+					if missing := missingExpectedOutputs(ctx, st.expectedOutputs); len(missing) > 0 && !loop.outputRescueUsed {
+						loop.outputRescueUsed = true
+						loop.repeatDetections = 0
 						pendingRepeatCorrective = expectedOutputMissingMessage(missing)
 						log.Printf("[agent] repeat loop at turn %d but named deliverable(s) %v not on disk — output-rescue steer instead of stopping", turn, logPaths(missing))
 					} else {
@@ -2631,7 +2395,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 						// a system action: no progress hint is set, no tool
 						// event is emitted, and the terminal stays stopped.
 						recovered := restoreSaferDeliverables(ctx)
-						endStream(TerminalStopped, "repeat_detector",
+						loop.endStream(TerminalStopped, "repeat_detector",
 							repeatTerminalSummary(ctx, st.expectedOutputs,
 								st.madeProductiveChange, recovered))
 						return nil
@@ -2986,29 +2750,29 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				// the breaker exists to stop a loop, and three distinct
 				// rejections in a row is the opposite of one.
 				if class := rejectionClass(result.Error); class != "" && class != ctx.LastRejectionClass {
-					if consecutiveErrors > 0 {
-						log.Printf("[agent] rejection changed kind at turn %d — resetting the error streak (was %d)", turn, consecutiveErrors)
+					if loop.consecutiveErrors > 0 {
+						log.Printf("[agent] rejection changed kind at turn %d — resetting the error streak (was %d)", turn, loop.consecutiveErrors)
 					}
-					consecutiveErrors = 0
+					loop.consecutiveErrors = 0
 					ctx.RecentFailurePaths = nil
 					ctx.LastRejectionClass = class
 				}
-				consecutiveErrors++
-				totalFailures++
+				loop.consecutiveErrors++
+				loop.totalFailures++
 				// Ceiling. Resetting the streak on a changed rejection kind
 				// is what lets a converging model keep going; without an
 				// absolute bound it also lets one cycle through failure modes
 				// indefinitely. Generous, because the whole point is that
 				// legitimate iteration costs several attempts per edit.
-				if totalFailures >= maxTotalFailures {
+				if loop.totalFailures >= maxTotalFailures {
 					log.Printf("[agent] breaking: %d failed tool calls this run (ceiling %d) at turn %d (productive=%v)",
-						totalFailures, maxTotalFailures, turn, st.madeProductiveChange)
+						loop.totalFailures, maxTotalFailures, turn, st.madeProductiveChange)
 					if st.madeProductiveChange {
 						emitTerminal(ctx, st, TerminalStopped, "failure_ceiling",
 							unverifiedSummary(true, "The run hit its failed-call ceiling before finishing."))
 					} else {
 						emitTerminal(ctx, st, TerminalStopped, "failure_ceiling", fmt.Sprintf(
-							"Stopped after %d failed tool calls with nothing landing on disk. The per-turn errors above say what was refused each time; the last one is the one to act on.", totalFailures))
+							"Stopped after %d failed tool calls with nothing landing on disk. The per-turn errors above say what was refused each time; the last one is the one to act on.", loop.totalFailures))
 					}
 					return nil
 				}
@@ -3022,27 +2786,27 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				if len(ctx.RecentFailurePaths) > 3 {
 					ctx.RecentFailurePaths = ctx.RecentFailurePaths[len(ctx.RecentFailurePaths)-3:]
 				}
-				if consecutiveErrors >= 3 {
+				if loop.consecutiveErrors >= 3 {
 					samePath := stuckOnOnePath(ctx.RecentFailurePaths)
 					if !samePath {
-						log.Printf("[agent] path-aware breaker: %d consecutive failures across different paths (%v) — continuing, not a stuck loop", consecutiveErrors, logPaths(ctx.RecentFailurePaths))
+						log.Printf("[agent] path-aware breaker: %d consecutive failures across different paths (%v) — continuing, not a stuck loop", loop.consecutiveErrors, logPaths(ctx.RecentFailurePaths))
 						// Reset consecutiveErrors so the multi-file grind
 						// can keep going. The recent-paths list stays as
 						// a rolling window so if subsequent fails DO
 						// collapse onto one path, we still catch it.
-						consecutiveErrors = 0
-					} else if missing := missingExpectedOutputs(ctx, st.expectedOutputs); len(missing) > 0 && !outputRescueUsed {
+						loop.consecutiveErrors = 0
+					} else if missing := missingExpectedOutputs(ctx, st.expectedOutputs); len(missing) > 0 && !loop.outputRescueUsed {
 						// Output-rescue (same as the repeat breaker): looping
 						// on failures without ever committing the named
 						// deliverable — steer toward it once before stopping.
-						outputRescueUsed = true
-						consecutiveErrors = 0
+						loop.outputRescueUsed = true
+						loop.consecutiveErrors = 0
 						ctx.RecentFailurePaths = nil
 						ctx.Messages = append(ctx.Messages, AgentMessage{Role: "user", Content: expectedOutputMissingMessage(missing)})
 						log.Printf("[agent] error loop at turn %d but named deliverable(s) %v not on disk — output-rescue steer instead of stopping", turn, logPaths(missing))
 					} else {
 						log.Printf("[agent] breaking error loop: %d consecutive failures on the same path %q at turn %d (productive=%v)",
-							consecutiveErrors, ctx.RecentFailurePaths[0], turn, st.madeProductiveChange)
+							loop.consecutiveErrors, ctx.RecentFailurePaths[0], turn, st.madeProductiveChange)
 						if st.madeProductiveChange {
 							emitTerminal(ctx, st, TerminalStopped, "same_target_failures",
 								"Wrote your changes to disk; couldn't verify them automatically (the verification commands failed). Run them yourself to confirm — they're on disk.")
@@ -3054,7 +2818,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 					}
 				}
 			} else {
-				consecutiveErrors = 0
+				loop.consecutiveErrors = 0
 				// Successful tool call resets the path window — the model
 				// is clearly making progress somewhere.
 				ctx.RecentFailurePaths = nil
@@ -3071,7 +2835,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				parsed.Name == "search_files" ||
 				parsed.Name == "find_file"
 			if isReadOnly {
-				consecutiveReads++
+				loop.consecutiveReads++
 				if result.Success {
 					// The model went looking at the project, so it read the
 					// message as work rather than conversation. Used by the
@@ -3081,7 +2845,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 					st.inspectedWorkspace = true
 				}
 			} else {
-				consecutiveReads = 0
+				loop.consecutiveReads = 0
 			}
 
 			// Add assistant message (the tool call) and tool result to conversation
@@ -3288,7 +3052,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 
 			// Exploration budget: after a run of read-only calls, steer the next
 			// turn toward a write, or toward the answer (explorationNudge).
-			if note := explorationNudge(&consecutiveReads, turn, !answerOnlyRequest(ctx)); note != "" {
+			if note := explorationNudge(&loop.consecutiveReads, turn, !answerOnlyRequest(ctx)); note != "" {
 				ctx.Messages = append(ctx.Messages, AgentMessage{Role: "user", Content: note})
 			}
 
@@ -4537,6 +4301,299 @@ func callLLMOnceRestating(ctx *AgentContext, messages []AgentMessage, temperatur
 		return "", totalTokens, nil
 	}
 	return contentBuf.String(), totalTokens, nil
+}
+
+// --- runAgentLoop's steps -----------------------------------------------------
+//
+// The state runAgentLoop carries from turn to turn, and the steps of a turn in
+// the order they run.
+
+// agentLoop is what runAgentLoop carries from one turn to the next: the run's
+// context, the request, the run state and the loop's own counters.
+// Exit-gate evidence + the shared bounce shape live on runState (see
+// its field docs); the remaining counters are loop-local.
+type agentLoop struct {
+	ctx         *AgentContext
+	userMessage string
+	st          *runState
+
+	consecutiveReads  int // Track consecutive read-only calls
+	consecutiveErrors int
+	totalFailures     int // Track consecutive tool failures to break error loops
+	repeatDetections  int // hard-stop after the 2nd repeated-identical-call detection
+	// Runaway backstop for content-varying write loops (#147 review finding
+	// #14): the content-fingerprint repeat detector, by design, does not
+	// catch a model that rewrites one file with materially different content
+	// every time and never converges. This counts total writes per path and
+	// escalates to the repeat corrective only at a threshold far above any
+	// realistic iteration (polyglot's healthiest run was ~10), so it stops a
+	// true runaway without regressing legitimate iteration.
+	writeCountByPath map[string]int
+	// One-shot: when a loop-stop is about to fire but the task's named
+	// deliverable was never written, steer toward it once instead of
+	// stopping (many hard tasks loop on run_command exploration and
+	// hard-stop without ever reaching the done/text exit where the
+	// expected-output gate lives — observed on sqlite and merge-diff).
+	outputRescueUsed bool
+	// Flag whether we've already injected the approaching-budget hint,
+	// so we don't fire it every turn after crossing the threshold.
+	budgetHintFired bool
+}
+
+// newAgentLoop sets up one run of the agent loop: its run state, with the
+// output obligation already decided, and counters that start at zero.
+func newAgentLoop(ctx *AgentContext, userMessage string, outputObligation obligationDecision) *agentLoop {
+	st := &runState{
+		expectedOutputs:       outputObligation.Items,
+		outputObligation:      outputObligation,
+		userWantsVerification: isFixIntentMessage(userMessage),
+	}
+	return &agentLoop{ctx: ctx, userMessage: userMessage, st: st, writeCountByPath: map[string]int{}}
+}
+
+// endStream ends the run with its terminal event.
+//
+// A tool_call is streamed the moment it parses, before permission and
+// execution, so every early exit between that point and the
+// tool_result leaves the client holding a call that never resolves —
+// a spinner with nothing coming. Observed 2026-08-03 on
+// multiturn_stats: the repetition breaker stopped the session one
+// line after announcing a call, and the stream carried 12 tool_call
+// events against 11 tool_result.
+//
+// endStream answers the outstanding call before the summary, so the
+// invariant holds at every exit rather than at each one that
+// remembered to.
+func (loop *agentLoop) endStream(status TerminalStatus, reason, summary string) {
+	emitTerminal(loop.ctx, loop.st, status, reason, summary)
+}
+
+// accountRefusedCall counts a call that a gate refused before dispatch as a
+// failed call, and reports whether the run must stop.
+//
+// Several branches refuse a call before dispatch and continue. Every one of
+// them is a failed call the model may ignore forever, so each has to reach
+// the same path-aware accounting an executed failure reaches -- the raw
+// pre-resolution intent, the canonical target, the counters, and the
+// bounded failure policy that reads them. Returns true when the caller must
+// stop; the caller keeps its own diagnostic, which is unchanged.
+//
+// A run that ended because the client left or the deadline fired is not a
+// model repeating itself, and those paths keep their own terminals.
+func (loop *agentLoop) accountRefusedCall(name string, intent json.RawMessage, rejection, failPath string) bool {
+	ctx, st := loop.ctx, loop.st
+	if ctx.Ctx != nil && ctx.Ctx.Err() != nil {
+		loop.consecutiveErrors++
+		return false
+	}
+	recordFailedToolCall(ctx, name, intent, rejection)
+	loop.consecutiveErrors++
+	loop.totalFailures++
+	ctx.RecentFailurePaths = appendRecentFailurePath(ctx.RecentFailurePaths, failPath)
+	if !shouldStopForFailures(loop.totalFailures, loop.consecutiveErrors, ctx.RecentFailurePaths) {
+		return false
+	}
+	log.Printf("[agent] breaking at turn %d: %d refused/failed calls, %d consecutive on %q",
+		st.turn, loop.totalFailures, loop.consecutiveErrors, failPath)
+	loop.endStream(TerminalStopped, "repeated_refusal",
+		repeatedRefusalSummary(name, failPath, st.madeProductiveChange)+
+			liveBackgroundJobNote(ctx))
+	return true
+}
+
+// beginAgentRun records what the request asked, before any turn runs, and
+// tells the event stream that the agent stage has started. It returns the
+// time the stage started.
+func beginAgentRun(ctx *AgentContext, userMessage string) time.Time {
+	// One snapshot per validated request, before any turn runs. Only the
+	// immutable inputs: the live decision belongs to the gate records.
+	emitShadowRequestSnapshot(ctx, userMessage)
+	// Capture the human's actual instruction before the loop appends
+	// anything: correctives, manifests and re-injected content all ride
+	// user-role messages, and everything downstream that needs "what was
+	// I asked" (the V3 bridge above all) must not confuse those with this.
+	ctx.HumanTask = userMessage
+	ctx.LiteralBlocks = extractLiteralBlocks(userMessage)
+	// What the user's workspace held before this request: a shell command
+	// that removes one of these files removes the user's work.
+	ctx.InitialWorkspace = snapshotWorkspace(ctx.WorkingDir)
+	if n := len(ctx.LiteralBlocks); n > 0 {
+		log.Printf("[agent] %d literal content contract(s) extracted from the request", n)
+	}
+	// Emit a stage_start envelope so the TUI's pipeline pane shows
+	// the agent is working. Mirrors the typed-event broker.
+	loopStart := time.Now()
+	Emit(NewEnvelope(EvtStageStart, "agent", map[string]interface{}{
+		"detail": fmt.Sprintf("tier=%s msg=%q", ctx.Tier,
+			truncateStr(userMessage, 80)),
+	}))
+	return loopStart
+}
+
+// endAgentStage closes the agent stage on the event stream and reports how
+// the run ended. runAgentLoop defers it, so it runs at every exit.
+func endAgentStage(ctx *AgentContext, loopStart time.Time) {
+	// A deletion approval the turn never consumed holds a reference to
+	// the object it was about. The turn is over; let it go.
+	releaseDeleteApproval(ctx)
+	// Close the "agent" stage so the pipeline pane stops showing it
+	// running. Without this, the TUI's pipelineState.apply only ever
+	// sees EvtDone (overall finish) and the agent row is stuck in
+	// Running() forever — visually misleading after the turn ended.
+	dur := time.Since(loopStart).Milliseconds()
+	// The broker said "success": true on every terminal, including every
+	// stop. It now reports the session's actual outcome, from the same
+	// field the SSE terminal used, so the two streams cannot disagree.
+	// `success` keeps its key and its type for existing readers.
+	status := ctx.TerminalStatus
+	if !status.Classified() {
+		status = TerminalIncomplete
+	}
+	Emit(Envelope{
+		EventID:    NewEventID(),
+		Timestamp:  float64(time.Now().UnixNano()) / 1e9,
+		Type:       EvtStageEnd,
+		Stage:      "agent",
+		DurationMS: dur,
+		Payload: map[string]interface{}{
+			"success":       status.Completed(),
+			"status":        string(status),
+			"reason":        ctx.TerminalReason,
+			"total_tokens":  ctx.TotalTokens,
+			"fenced_calls":  ctx.FencedCalls,
+			"fenced_tokens": ctx.FencedTokens,
+		},
+	})
+	donePayload := map[string]interface{}{
+		"success":           status.Completed(),
+		"status":            string(status),
+		"reason":            ctx.TerminalReason,
+		"total_duration_ms": dur,
+		"total_tokens":      ctx.TotalTokens,
+		"fenced_calls":      ctx.FencedCalls,
+		"fenced_tokens":     ctx.FencedTokens,
+	}
+	if ctx.TerminalUnresolved != "" {
+		donePayload["unresolved"] = ctx.TerminalUnresolved
+	}
+	Emit(Envelope{
+		EventID:    NewEventID(),
+		Timestamp:  float64(time.Now().UnixNano()) / 1e9,
+		Type:       EvtDone,
+		Stage:      "agent",
+		DurationMS: dur,
+		Payload:    donePayload,
+	})
+}
+
+// openConversation plans the request, builds the system prompt and opens the
+// conversation the model will see. It reports false when the run must not
+// start because the proxy and the sandbox look at different directories; the
+// run has then already ended with that reason.
+func openConversation(ctx *AgentContext, userMessage string) bool {
+	// Pre-flight plan generation. Runs BEFORE buildSystemPrompt so
+	// the system prompt can reference the planned steps — the model
+	// gets explicit guidance on what to do first instead of having
+	// to infer it from the user message alone. Skipped for trivial
+	// chat / acks where the ~5-15s cost isn't worth it. Failures
+	// degrade silently — the loop runs without adherence gating.
+	if shouldGeneratePlan(ctx, userMessage) {
+		if plan := generatePlan(ctx, userMessage); plan != nil {
+			ctx.Plan = plan
+			log.Printf("[agent] plan: %d steps, verify=%s, score=%.2f",
+				len(plan.Steps), plan.VerifyStep, plan.WinningScore)
+		}
+	}
+
+	// Build system prompt with tool descriptions, project context,
+	// and (when present) the planned steps.
+	systemPrompt := buildSystemPrompt(ctx)
+
+	// Initialize messages: system prompt, then any prior-turn history
+	// the TUI shipped, then the new user message. PriorHistory is
+	// already filtered to role=user|assistant text turns (no tool
+	// calls/results, no system spam) on the TUI side. Without this,
+	// every user message starts a fresh agent loop and the model can't
+	// answer follow-ups like "what did you just delete?".
+	// Refuse to start on a split workspace. The proxy writing to one host
+	// directory while the sandbox that runs commands is bound to another is
+	// invisible to every /health, and the session that follows is worse than
+	// useless: files land, `run_command` reports them missing, and the model
+	// spends its turns concluding its own work does not exist. Cached with a
+	// TTL, so this is one probe per session at most.
+	if problem := verifyWorkspaceAlignment(ctx); problem != "" {
+		log.Printf("[agent] refusing to start — proxy and sandbox workspaces are not aligned")
+		emitTerminal(ctx, nil, TerminalFailed, "workspace_misaligned", problem)
+		return false
+	}
+
+	ctx.Messages = make([]AgentMessage, 0, 3+len(ctx.PriorHistory))
+	ctx.Messages = append(ctx.Messages, AgentMessage{Role: "system", Content: systemPrompt})
+	ctx.Messages = append(ctx.Messages, ctx.PriorHistory...)
+
+	// GH #39 point 4: auto-inject reachability slice. If the user
+	// message names project symbols (`dashboard`, "the foo function",
+	// foo.bar.baz), pre-load their definitions so the model doesn't
+	// burn agent turns on read_file/list_directory recon. Fail-soft —
+	// no v3-service / no symbols / no project files / network error
+	// all degrade silently to the original message-only flow.
+	if symbols := extractCandidateSymbols(userMessage); len(symbols) > 0 {
+		injectSymbolContext(ctx, symbols)
+	}
+
+	ctx.Messages = append(ctx.Messages, AgentMessage{Role: "user", Content: userMessage})
+
+	// Per-session cache scope. llama.cpp's KV slot persists between
+	// requests by default — that's what keepLlamaWarm relies on. But the
+	// slot also persists *across user sessions*, so context from a previous
+	// session's conversation can bias the next session (the
+	// `show_greeting.py` hallucination from the 2026-04-30 snake test was
+	// likely an example). Erase slot 0 at the start of each agent loop call.
+	// llama.cpp re-encodes the system prompt from scratch (~1-2s on a
+	// warm GPU); the per-turn cache benefit within the session is preserved.
+	// Disable with ATLAS_FRESH_SLOT_PER_SESSION=0.
+	if envOr("ATLAS_FRESH_SLOT_PER_SESSION", "1") != "0" && !ctx.DisableFreshSlot {
+		eraseLlamaSlot(ctx)
+	}
+	return true
+}
+
+// injectSymbolContext adds the definitions of the project symbols the request
+// names, and their call-graph neighbourhood, to the conversation, so the model
+// need not spend turns finding them. Every failure leaves the conversation as
+// it was.
+func injectSymbolContext(ctx *AgentContext, symbols []string) {
+	fileMap := walkPythonFiles(ctx.WorkingDir)
+	if len(fileMap) > 0 {
+		if idx, ok := resolveProjectSymbols(ctx, fileMap, symbols); ok && len(idx.Matched) > 0 {
+			body := formatProjectContextMessage(idx.Matched)
+			// #39 Phase 3: append the call-graph neighborhood v3-service
+			// returned. Empty string when it returned none.
+			body += formatGraphNeighborhood(idx.Graph)
+			if body != "" {
+				// Role MUST be "user" with a "[system note]:" prefix —
+				// Some Jinja chat templates enforce "System message
+				// must be at the beginning" and 500s on any system
+				// role appended mid-conversation. Same convention
+				// the lens-intervention path uses (commit b79b31d).
+				ctx.Messages = append(ctx.Messages, AgentMessage{
+					Role:    "user",
+					Content: "[system note]: " + body,
+				})
+				names := make([]string, 0, len(idx.Matched))
+				for _, m := range idx.Matched {
+					names = append(names, m.Name)
+				}
+				log.Printf("[symbol_index] injected %d snippet(s) for [%s] from %d project files",
+					len(idx.Matched), strings.Join(names, ", "), len(fileMap))
+				ctx.Stream("symbol_index_injected", map[string]interface{}{
+					"matched": names,
+					"n_files": len(fileMap),
+					"skipped": len(idx.Skipped),
+				})
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
