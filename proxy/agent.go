@@ -1271,119 +1271,11 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				if json.Unmarshal(parsed.Args, &wfInput) == nil {
 					existingPath := resolveAgentPath(ctx, wfInput.Path)
 					existing, readErr := os.ReadFile(existingPath)
-					if readErr != nil && !os.IsNotExist(readErr) {
-						// Every existing-file protection lives inside the
-						// success branch below, so a read that fails for any
-						// reason other than "the file is genuinely new" silently
-						// disarms all of them and the write lands unguarded.
-						// A ~100-line file was replaced by three lines this way
-						// with no guard log at all, and the guard has never once
-						// fired in a full session log.
-						log.Printf("[agent] write_file pre-check could not read %q (resolved %q): %v — existing-file guards are NOT applied to this write",
-							wfInput.Path, existingPath, readErr)
-					}
-					if readErr == nil {
-						existingLines := strings.Count(string(existing), "\n") + 1
-						// Exempt corrupted files. If the existing file
-						// looks like it has prose preamble or stray
-						// markdown fences (sanitizeFileContent would change
-						// it), the only way to clean it up is full
-						// replacement. edit_file can't express "remove
-						// these specific corrupted lines" cleanly; the
-						// model proved this by emitting old_str = new_str
-						// for 53 wall-minutes (May 6 18:30 → 19:23).
-						// Allow write_file in that case and log the
-						// self-heal.
-						// Self-iteration carveout: if this session wrote the file
-						// itself (it's not the user's code, it's the agent's
-						// own draft), allow overwriting. Otherwise the agent
-						// can't correct its own first-pass mistakes — the
-						// May 12 multi-file failure mode where V3 wrote a
-						// stub app.py, realized it needed render-module
-						// wiring, and got blocked from fixing it.
-						sessionOwned := ctx.SessionWrites[wfInput.Path]
-						corrupted := looksCorruptedOnDisk(existingPath, string(existing))
-						// Existing, never read, not ours: refuse regardless of
-						// size. The >5-line rule below is about "is a surgical
-						// edit cheaper than a rewrite", which is a different
-						// question from "should this be replaced at all" — and
-						// you cannot know a file should be replaced when you
-						// have never looked at it. edit_file and
-						// structural_edit already demand a read first; this
-						// closes the one path that did not.
-						//
-						// Observed twice: given a 1-line puzzle input, the
-						// model recognised the puzzle from training, wrote the
-						// canonical textbook example over the real input
-						// without reading it, and solved the wrong data while
-						// honestly reporting "created input.txt with sample
-						// data".
-						if isUnreadOverwrite(ctx, existingPath, corrupted, sessionOwned) {
-							rejection := fmt.Sprintf(
-								"%s already exists and this session has not read it. Use read_file first: if it holds input or configuration you were given, you need its real contents, not a replacement. If you have read it and still mean to replace the whole file, use edit_file or structural_edit.",
-								wfInput.Path)
-							log.Printf("[agent] rejecting write_file over unread existing %q (%d lines)", wfInput.Path, existingLines)
-							if r := steerRecovery(ctx, st, wfInput.Path, existingPath, true); r != "" {
-								rejection = r
-							}
-							st.bounceToolCall(ctx, "write_file", rejection)
-							// Steering, not a verdict on the work: the model
-							// is being sent to a better tool. But a model that
-							// ignores the steer repeats the same refused write
-							// forever -- measured at 31 turns in a healthy
-							// workspace with no terminal of ATLAS's own -- so
-							// the ignored steer is accounted like any other
-							// refused call. A model that follows it pays
-							// nothing further: the next call is a different
-							// action on the path and clears the state.
-							if loop.accountRefusedCall("write_file", intentArgs, rejection,
-								workspaceRefusalPath(ctx, "write_file", parsed.Args)) {
-								return nil
-							}
-							continue
-						}
-						if existingLines > 5 && !corrupted && !sessionOwned {
-							// GH #39: when the existing file is .py or .html
-							// and the model is replacing the whole thing,
-							// structural_edit is the right tool — selector-based
-							// node replacement, no old_str literal, no
-							// truncation risk on long content. Surface
-							// the option in the rejection text. edit_file
-							// stays the recommendation for surgical
-							// string-level changes (other file types,
-							// inline tweaks).
-							ext := strings.ToLower(filepath.Ext(wfInput.Path))
-							structuralHint := ""
-							if ext == ".py" || ext == ".html" || ext == ".htm" {
-								structuralHint = " For whole-function or whole-element rewrites, prefer `structural_edit` — it takes a structural selector (e.g. `function:dashboard`, `<body>`) and the new content body, no `old_str` needed. structural_edit doesn't truncate the way edit_file can on long replacement strings."
-							}
-							rejection := fmt.Sprintf(
-								"File %s already exists (%d lines). write_file is for creating new files, not modifying existing ones. Use edit_file with old_str/new_str to make targeted changes (read the file first if you need to confirm the exact text to replace).%s",
-								wfInput.Path, existingLines, structuralHint)
-							// %q quotes + escapes the path (go/log-injection).
-							log.Printf("[agent] rejecting write_file for existing %q (%d lines)", wfInput.Path, existingLines)
-							if r := steerRecovery(ctx, st, wfInput.Path, existingPath, false); r != "" {
-								rejection = r
-							}
-							st.bounceToolCall(ctx, "write_file", rejection)
-							// Same shape, same bound as the unread-overwrite
-							// steer above.
-							if loop.accountRefusedCall("write_file", intentArgs, rejection,
-								workspaceRefusalPath(ctx, "write_file", parsed.Args)) {
-								return nil
-							}
-							continue
-						}
-						if existingLines > 5 {
-							// Name the actual carveout — the corrupted-file
-							// message on a session-owned overwrite sent a
-							// loop diagnosis down the wrong path (2026-07-18).
-							if corrupted {
-								log.Printf("[agent] allowing write_file on corrupted %s (%d lines, sanitizer would clean it)", wfInput.Path, existingLines)
-							} else {
-								log.Printf("[agent] allowing write_file on session-owned %s (%d lines, self-iteration carveout)", wfInput.Path, existingLines)
-							}
-						}
+					switch loop.guardExistingFileWrite(parsed, intentArgs, wfInput, existingPath, existing, readErr) {
+					case turnEnds:
+						continue
+					case runEnds:
+						return nil
 					}
 				}
 			}
@@ -4616,6 +4508,147 @@ func (loop *agentLoop) refuseFencedFetch(turn int, parsed ModelResponse, intentA
 					liveBackgroundJobNote(ctx))
 			return runEnds
 		}
+	}
+	return turnEnds
+}
+
+// guardExistingFileWrite applies the existing-file guards to a write_file,
+// given what the read of its target found: a target this session never read
+// is refused, and so is a whole-file rewrite of a file over five lines that is
+// neither corrupted nor this session's own.
+func (loop *agentLoop) guardExistingFileWrite(parsed ModelResponse, intentArgs json.RawMessage, wfInput WriteFileInput,
+	existingPath string, existing []byte, readErr error) turnOutcome {
+	ctx := loop.ctx
+	if readErr != nil && !os.IsNotExist(readErr) {
+		// Every existing-file protection lives inside the
+		// success branch below, so a read that fails for any
+		// reason other than "the file is genuinely new" silently
+		// disarms all of them and the write lands unguarded.
+		// A ~100-line file was replaced by three lines this way
+		// with no guard log at all, and the guard has never once
+		// fired in a full session log.
+		log.Printf("[agent] write_file pre-check could not read %q (resolved %q): %v — existing-file guards are NOT applied to this write",
+			wfInput.Path, existingPath, readErr)
+	}
+	if readErr == nil {
+		existingLines := strings.Count(string(existing), "\n") + 1
+		// Exempt corrupted files. If the existing file
+		// looks like it has prose preamble or stray
+		// markdown fences (sanitizeFileContent would change
+		// it), the only way to clean it up is full
+		// replacement. edit_file can't express "remove
+		// these specific corrupted lines" cleanly; the
+		// model proved this by emitting old_str = new_str
+		// for 53 wall-minutes (May 6 18:30 → 19:23).
+		// Allow write_file in that case and log the
+		// self-heal.
+		// Self-iteration carveout: if this session wrote the file
+		// itself (it's not the user's code, it's the agent's
+		// own draft), allow overwriting. Otherwise the agent
+		// can't correct its own first-pass mistakes — the
+		// May 12 multi-file failure mode where V3 wrote a
+		// stub app.py, realized it needed render-module
+		// wiring, and got blocked from fixing it.
+		sessionOwned := ctx.SessionWrites[wfInput.Path]
+		corrupted := looksCorruptedOnDisk(existingPath, string(existing))
+		// Existing, never read, not ours: refuse regardless of
+		// size. The >5-line rule below is about "is a surgical
+		// edit cheaper than a rewrite", which is a different
+		// question from "should this be replaced at all" — and
+		// you cannot know a file should be replaced when you
+		// have never looked at it. edit_file and
+		// structural_edit already demand a read first; this
+		// closes the one path that did not.
+		//
+		// Observed twice: given a 1-line puzzle input, the
+		// model recognised the puzzle from training, wrote the
+		// canonical textbook example over the real input
+		// without reading it, and solved the wrong data while
+		// honestly reporting "created input.txt with sample
+		// data".
+		if isUnreadOverwrite(ctx, existingPath, corrupted, sessionOwned) {
+			return loop.refuseUnreadOverwrite(parsed, intentArgs, wfInput, existingPath, existingLines)
+		}
+		if existingLines > 5 && !corrupted && !sessionOwned {
+			return loop.refuseWholeFileRewrite(parsed, intentArgs, wfInput, existingPath, existingLines)
+		}
+		if existingLines > 5 {
+			// Name the actual carveout — the corrupted-file
+			// message on a session-owned overwrite sent a
+			// loop diagnosis down the wrong path (2026-07-18).
+			if corrupted {
+				log.Printf("[agent] allowing write_file on corrupted %s (%d lines, sanitizer would clean it)", wfInput.Path, existingLines)
+			} else {
+				log.Printf("[agent] allowing write_file on session-owned %s (%d lines, self-iteration carveout)", wfInput.Path, existingLines)
+			}
+		}
+	}
+	return turnContinues
+}
+
+// refuseUnreadOverwrite refuses a write_file over an existing file this
+// session never read, and counts the refusal.
+func (loop *agentLoop) refuseUnreadOverwrite(parsed ModelResponse, intentArgs json.RawMessage, wfInput WriteFileInput,
+	existingPath string, existingLines int) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	rejection := fmt.Sprintf(
+		"%s already exists and this session has not read it. Use read_file first: if it holds input or configuration you were given, you need its real contents, not a replacement. If you have read it and still mean to replace the whole file, use edit_file or structural_edit.",
+		wfInput.Path)
+	log.Printf("[agent] rejecting write_file over unread existing %q (%d lines)", wfInput.Path, existingLines)
+	if r := steerRecovery(ctx, st, wfInput.Path, existingPath, true); r != "" {
+		rejection = r
+	}
+	st.bounceToolCall(ctx, "write_file", rejection)
+	// Steering, not a verdict on the work: the model
+	// is being sent to a better tool. But a model that
+	// ignores the steer repeats the same refused write
+	// forever -- measured at 31 turns in a healthy
+	// workspace with no terminal of ATLAS's own -- so
+	// the ignored steer is accounted like any other
+	// refused call. A model that follows it pays
+	// nothing further: the next call is a different
+	// action on the path and clears the state.
+	if loop.accountRefusedCall("write_file", intentArgs, rejection,
+		workspaceRefusalPath(ctx, "write_file", parsed.Args)) {
+		return runEnds
+	}
+	return turnEnds
+}
+
+// refuseWholeFileRewrite refuses a write_file that rewrites an existing file of
+// more than five lines, points the model at a targeted edit, and counts the
+// refusal.
+func (loop *agentLoop) refuseWholeFileRewrite(parsed ModelResponse, intentArgs json.RawMessage, wfInput WriteFileInput,
+	existingPath string, existingLines int) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	// GH #39: when the existing file is .py or .html
+	// and the model is replacing the whole thing,
+	// structural_edit is the right tool — selector-based
+	// node replacement, no old_str literal, no
+	// truncation risk on long content. Surface
+	// the option in the rejection text. edit_file
+	// stays the recommendation for surgical
+	// string-level changes (other file types,
+	// inline tweaks).
+	ext := strings.ToLower(filepath.Ext(wfInput.Path))
+	structuralHint := ""
+	if ext == ".py" || ext == ".html" || ext == ".htm" {
+		structuralHint = " For whole-function or whole-element rewrites, prefer `structural_edit` — it takes a structural selector (e.g. `function:dashboard`, `<body>`) and the new content body, no `old_str` needed. structural_edit doesn't truncate the way edit_file can on long replacement strings."
+	}
+	rejection := fmt.Sprintf(
+		"File %s already exists (%d lines). write_file is for creating new files, not modifying existing ones. Use edit_file with old_str/new_str to make targeted changes (read the file first if you need to confirm the exact text to replace).%s",
+		wfInput.Path, existingLines, structuralHint)
+	// %q quotes + escapes the path (go/log-injection).
+	log.Printf("[agent] rejecting write_file for existing %q (%d lines)", wfInput.Path, existingLines)
+	if r := steerRecovery(ctx, st, wfInput.Path, existingPath, false); r != "" {
+		rejection = r
+	}
+	st.bounceToolCall(ctx, "write_file", rejection)
+	// Same shape, same bound as the unread-overwrite
+	// steer above.
+	if loop.accountRefusedCall("write_file", intentArgs, rejection,
+		workspaceRefusalPath(ctx, "write_file", parsed.Args)) {
+		return runEnds
 	}
 	return turnEnds
 }
