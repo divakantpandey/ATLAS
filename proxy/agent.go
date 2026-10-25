@@ -1280,286 +1280,12 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				}
 			}
 
-			runawayWrite, refused := loop.refuseBeforeDispatch(turn, parsed, intentArgs)
-			switch refused {
+			result, steers, callOutcome, callErr := loop.runToolCall(turn, parsed, intentArgs)
+			switch callOutcome {
 			case turnEnds:
 				continue
 			case runEnds:
-				return nil
-			}
-
-			// Tool-call repetition detector. Catches the structural-loop
-			// case the lens scoring doesn't see: same exact (tool, args)
-			// emitted N times in close succession. Lens covers semantic
-			// repetition (model produced the same low-quality content);
-			// this covers structural repetition (model emitted the same
-			// call to read_file or run_command). Fires before tool
-			// execution so the corrective lands in the same iteration
-			// as the lens corrective if both trigger.
-			pendingRepeatCorrective := ""
-			if msg, _, repeating := recordToolCall(ctx, parsed.Name, intentArgs); repeating || runawayWrite {
-				if runawayWrite && !repeating {
-					msg = "You have rewritten this file an unusually large number of times without converging. Stop rewriting the whole file — read the current on-disk version, make ONE targeted change with edit_file/structural_edit, or step back and reconsider the approach; if the task is satisfied, respond with done."
-					// The detector clears its window only when IT fires.
-					// The backstop is a separate trigger for the same
-					// corrective, so clear it here too.
-					resetToolRepeatWindow(ctx)
-				}
-				log.Printf("[agent] tool-call repetition at turn %d on %s — queuing corrective for next turn", turn, parsed.Name)
-				ctx.Stream("agent_repeat_intervention", map[string]interface{}{
-					"turn":   turn,
-					"tool":   parsed.Name,
-					"reason": msg,
-				})
-				pendingRepeatCorrective = msg
-				loop.repeatDetections++
-				// Steer-before-kill ladder. On the FIRST detection, fall
-				// through: pendingRepeatCorrective is injected below and the
-				// loop continues, so the model gets an explicit nudge to
-				// change approach before we ever terminate. Only hard-stop
-				// on the SECOND detection — the model saw the steer and
-				// repeated anyway (genuinely stuck).
-				//
-				// The old code hard-stopped on the FIRST detection whenever
-				// st.madeProductiveChange was set ("work landed, model spinning
-				// on verification"). That mistook legitimate iteration for a
-				// loop: 2026-07-19 showed models one nudge from finishing
-				// — regex-chess repeating a verify command that itself had a
-				// syntax error, polyglot mid-fix — killed with their solution
-				// on disk but unverified. A nudge first is the whole point:
-				// the broken-verify steer (below) can turn exactly these into
-				// completions.
-				if loop.repeatDetections >= 2 {
-					// Output-rescue: if the task named a deliverable and it
-					// isn't on disk, the model is looping WITHOUT having
-					// committed its answer — steer toward the file once and
-					// keep going rather than hard-stopping empty-handed.
-					if missing := missingExpectedOutputs(ctx, st.expectedOutputs); len(missing) > 0 && !loop.outputRescueUsed {
-						loop.outputRescueUsed = true
-						loop.repeatDetections = 0
-						pendingRepeatCorrective = expectedOutputMissingMessage(missing)
-						log.Printf("[agent] repeat loop at turn %d but named deliverable(s) %v not on disk — output-rescue steer instead of stopping", turn, logPaths(missing))
-					} else {
-						log.Printf("[agent] second repetition detection at turn %d — stopping (productive_change_hint=%v)", turn, st.madeProductiveChange)
-						// The one terminal wired to recovery. It runs BEFORE
-						// the summary so the disclosure describes the bytes
-						// that are actually on disk when the run ends. It is
-						// a system action: no progress hint is set, no tool
-						// event is emitted, and the terminal stays stopped.
-						recovered := restoreSaferDeliverables(ctx)
-						loop.endStream(TerminalStopped, "repeat_detector",
-							repeatTerminalSummary(ctx, st.expectedOutputs,
-								st.madeProductiveChange, recovered))
-						return nil
-					}
-				}
-			}
-
-			// Reasoning-repetition detector (BiasBusters #30). The
-			// model's reasoning_content stream is captured per-turn in
-			// ctx.LastTurnReasoning by callLLMOnce. recordReasoning
-			// compares the normalized opening prefix against the prior
-			// turn's snippet; ≥2 consecutive identical openings fires
-			// the intervention. Sibling to the structural repeat
-			// detector (above) and the lens regression detector (below)
-			// — three different angles on "model is stuck", catching
-			// different shapes of stuck-ness.
-			pendingReasoningCorrective := ""
-			if msg, obs, repeating := recordReasoning(ctx, ctx.LastTurnReasoning); repeating {
-				log.Printf("[agent] reasoning repetition at turn %d (consecutive=%d) — queuing corrective", turn, obs.Count)
-				ctx.Stream("agent_reasoning_intervention", map[string]interface{}{
-					"turn":        turn,
-					"consecutive": obs.Count,
-					"reason":      msg,
-					"snippet":     obs.Snippet,
-				})
-				pendingReasoningCorrective = msg
-			}
-
-			// Score write_file/edit_file content with the geometric lens
-			// BEFORE executing. The score reflects what the model produced
-			// (independent of whether the tool succeeds). On a quality-crash pattern (N consecutive
-			// low scores) we queue a corrective system message that gets
-			// appended AFTER the tool result so the next LLM call sees:
-			// assistant(tool_call) → tool(result) → system(lens warning).
-			// This is the direct fix for the May 6 templates/resources.html
-			// stub-loop case where the stub gate kept rejecting but the model
-			// kept retrying the same stub.
-			pendingLensCorrective := ""
-			if scorable, ok := extractScorableContent(parsed.Name, parsed.Args); ok {
-				score, scored, down := scoreContentForAgent(ctx.Ctx, ctx.LensURL, scorable)
-				if down != "" {
-					return st.stopLensDown(ctx, parsed.Name, down)
-				}
-				if scored {
-					ctx.LensScoreHistory = append(ctx.LensScoreHistory, score.Aggregate.GxScoreMin)
-					log.Printf("[agent] lens turn=%d tool=%s gx_min=%.3f gx_mean=%.3f off_rails=%d n_tok=%d latency=%.0fms history=%s",
-						turn, parsed.Name,
-						score.Aggregate.GxScoreMin, score.Aggregate.GxScoreMean,
-						score.Aggregate.FirstOffRailsIdx, score.NTokens,
-						score.LatencyMS, formatScoreSlice(ctx.LensScoreHistory))
-					ctx.Stream("agent_lens_score", map[string]interface{}{
-						"tool":                parsed.Name,
-						"turn":                turn,
-						"n_tokens":            score.NTokens,
-						"first_off_rails_idx": score.Aggregate.FirstOffRailsIdx,
-						"gx_score_min":        score.Aggregate.GxScoreMin,
-						"gx_score_mean":       score.Aggregate.GxScoreMean,
-						"latency_ms":          score.LatencyMS,
-					})
-					if low, severe, calibrated := score.calibratedThresholds(); calibrated {
-						if msg, intervene := agentLensRegression(ctx.LensScoreHistory, low, severe); intervene {
-							log.Printf("[agent] lens regression at turn %d on %s — queuing corrective for next turn", turn, parsed.Name)
-							ctx.Stream("agent_lens_intervention", map[string]interface{}{
-								"turn":   turn,
-								"tool":   parsed.Name,
-								"reason": msg,
-							})
-							pendingLensCorrective = msg
-							// Reset history so we don't re-fire on the same crash.
-							ctx.LensScoreHistory = nil
-						}
-					}
-				}
-			}
-
-			// Execute tool. A re-read of an unchanged file already in
-			// context is served from a compact pointer instead of
-			// re-injecting + re-encoding the whole file (see
-			// redundantReadShortCircuit).
-			startTime := time.Now()
-			result := redundantReadShortCircuit(parsed.Name, parsed.Args, ctx)
-			if result != nil {
-				log.Printf("[agent] turn=%d short-circuited redundant read (already in context, unchanged)", turn)
-			}
-			if result == nil && (parsed.Name == "run_command" || parsed.Name == "run_background") {
-				if blk := runBlockAfterTraceback(ctx); blk != nil {
-					result = blk
-					log.Printf("[agent] turn=%d blocked re-run after traceback — forcing an edit first", turn)
-				}
-			}
-			if result == nil {
-				result = executeToolCall(parsed.Name, parsed.Args, ctx)
-				// The deadline can land in the middle of a tool call. Stop
-				// here rather than starting another turn on a dead context.
-				if ctx.Ctx != nil && ctx.Ctx.Err() != nil {
-					return finishCancelledRun(ctx, st, turn)
-				}
-				// Debt is settled from the ledger's own evidence, never from
-				// the call reporting that it worked.
-				settleMutationDebt(ctx, st)
-			}
-			elapsed := time.Since(startTime)
-
-			// On failure, log the error so it shows up in `docker compose
-			// logs atlas-proxy` without having to attach a debugger.
-			if !result.Success {
-				log.Printf("[agent] turn=%d tool=%q FAIL: %q", turn,
-					truncateStr(parsed.Name, 64), truncateStr(result.Error, 240))
-				recordFailedToolCall(ctx, parsed.Name,
-					retryIdentityArgs(parsed.Name, intentArgs, parsed.Args), result.Error)
-				// C4: a replacement refused while the file it targeted stayed
-				// valid. The second distinct proposal against one generation
-				// is the evidence that the refusal text alone is not landing,
-				// and the answer rides on the SAME result -- one call, one
-				// result, and the model reads it in the same message.
-				if key, sha, distinct := noteRejectedProposal(ctx, st, parsed.Name,
-					parsed.Args, result); distinct >= 2 {
-					rel := ledgerArgPath(parsed.Args, "path")
-					if msg := rejectedProposalRecovery(ctx, st, rel, key, sha); msg != "" {
-						result.Error += "\n\n" + msg
-					}
-				}
-			} else {
-				// A call can fail and later succeed — an edit rejected for a
-				// stale range works after a re-read. Drop the memory with the
-				// condition that caused it.
-				clearFailedToolCall(ctx, parsed.Name,
-					retryIdentityArgs(parsed.Name, intentArgs, parsed.Args))
-				clearSteerState(ctx, st, parsed.Name, parsed.Args)
-				clearBrokenArtifactState(ctx, st, parsed.Name, intentArgs)
-			}
-
-			st.pendingToolCall = ""
-			ctx.Stream("tool_result", map[string]interface{}{
-				"tool":    parsed.Name,
-				"success": result.Success,
-				"data":    json.RawMessage(result.Data),
-				"error":   result.Error,
-				"elapsed": elapsed.String(),
-			})
-			Emit(Envelope{
-				EventID:    NewEventID(),
-				Timestamp:  float64(time.Now().UnixNano()) / 1e9,
-				Type:       EvtToolResult,
-				Stage:      "tool",
-				DurationMS: elapsed.Milliseconds(),
-				Payload: map[string]interface{}{
-					"name":    parsed.Name,
-					"success": result.Success,
-					"error":   truncateStr(result.Error, 120),
-				},
-			})
-			// The lens stopped scoring inside this call (V3 reported it):
-			// the run ends here, saying why (lens_required.go).
-			if why := ctx.lensDownReason(); why != "" {
-				emitTerminal(ctx, st, TerminalFailed, "lens_unavailable",
-					lensUnavailableSummary(why, st.madeProductiveChange)+liveBackgroundJobNote(ctx))
-				return nil
-			}
-
-			// Track productive state changes — write/edit/delete that landed.
-			// Used below to soften the error-loop exit when work was completed
-			// AND by the done-without-action gate so a feature prompt
-			// ("rewrite X", "add Y") can't declare done without any actual
-			// edit on disk. structural_edit was missing from this list pre-May-10,
-			// which let a structural_edit-only success path slip past the
-			// productive-change tracking too.
-			// insert_after and replace_lines were absent, so a turn whose only
-			// work was a successful insert did not count as productive and the
-			// action gate could bounce it for having "done nothing".
-			// A landed write whose result carries a parse warning is pending
-			// execution; a landed clean write clears its own pending mark.
-			if result.Success && parsed.Name == "write_file" {
-				var wf WriteFileInput
-				if json.Unmarshal(parsed.Args, &wf) == nil {
-					var out WriteFileOutput
-					warned := json.Unmarshal(result.Data, &out) == nil && out.Warning != ""
-					st.markWarnedRun(ctx, wf.Path, warned)
-				}
-			}
-			if (parsed.Name == "run_command" || parsed.Name == "run_background") && result != nil {
-				// Discharge only the marks this command actually attempted to
-				// EXECUTE. Two prior rules both failed an audit: clearing on
-				// any command let `ls` bless a warned file, and clearing on a
-				// filename substring let `cat solve.py` or `grep main solve.py`
-				// do the same — naming a file is not running it. The mark is
-				// "this version has never been executed"; only an execution
-				// attempt (interpreter invocation or ./file) changes that fact,
-				// and the attempt itself suffices — pass or fail, the model has
-				// now seen the real runtime behavior.
-				//
-				// run_background is an execution attempt too. A server script
-				// is redirected there by the foreground gate, and its settle
-				// window returns the same traceback run_command would; a mark
-				// that only run_command could discharge left the file
-				// permanently "never run" (observed 2026-09-14: the model ran
-				// app.py in the background, read the SyntaxError, and had its
-				// fix refused for not having run the file).
-				var rc struct {
-					Command string `json:"command"`
-				}
-				if json.Unmarshal(parsed.Args, &rc) == nil {
-					for p := range st.pendingWarnedRun {
-						if executionAttempt(rc.Command, p) {
-							delete(st.pendingWarnedRun, p)
-						}
-					}
-					// A clean execution is the strongest demonstration a file
-					// can get, and it settles the content debt the parse-based
-					// routes never reached.
-					settleDebtByExecution(ctx, st, rc.Command, executionSucceeded(parsed.Name, result))
-				}
+				return callErr
 			}
 			if result.Success && len(ctx.LiteralBlocks) > 0 &&
 				(parsed.Name == "write_file" || parsed.Name == "edit_file" ||
@@ -1602,6 +1328,16 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 					}
 				}
 			}
+			// Track productive state changes — write/edit/delete that landed.
+			// Used below to soften the error-loop exit when work was completed
+			// AND by the done-without-action gate so a feature prompt
+			// ("rewrite X", "add Y") can't declare done without any actual
+			// edit on disk. structural_edit was missing from this list pre-May-10,
+			// which let a structural_edit-only success path slip past the
+			// productive-change tracking too.
+			// insert_after and replace_lines were absent, so a turn whose only
+			// work was a successful insert did not count as productive and the
+			// action gate could bounce it for having "done nothing".
 			// move_file was missing here, so a successful rename counted as no
 			// work at all: the run reported "Nothing was written -- no file was
 			// created or changed" while the destination sat on disk. A
@@ -1680,14 +1416,14 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 						source = string(b)
 					}
 					if sels := selectorsInFile(mp, source); len(sels) > 0 {
-						pendingRepeatCorrective = "edit_file's old_str did not match " +
+						steers.repeat = "edit_file's old_str did not match " +
 							mp + " (small drift in whitespace/quotes is enough to miss). " +
 							"Do NOT re-read or run the file — switch to structural_edit, which " +
 							"needs no old_str: call it with path " + mp + ", the selector of the " +
 							"node you are changing, and that node's complete replacement as " +
 							"content. " + selectorGuidance(mp, source) + "."
 					} else {
-						pendingRepeatCorrective = "edit_file's old_str did not match " +
+						steers.repeat = "edit_file's old_str did not match " +
 							mp + " (small drift in whitespace/quotes is enough to miss). " +
 							selectorGuidanceOrOutline(mp, source) + ". Use replace_lines with " +
 							"the line numbers read_file shows instead of reproducing old_str."
@@ -1842,15 +1578,15 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				// instruction both adopting sessions acted on. The score is
 				// still recorded and still counts toward the history; what is
 				// dropped is telling the model to act on it.
-				if pendingLensCorrective != "" {
+				if steers.lens != "" {
 					log.Printf("[agent] dropping the lens corrective for %s — it scored content the delivery replaced",
 						logPath(superseded.Path))
-					pendingLensCorrective = ""
+					steers.lens = ""
 				}
 			}
-			st.queueCorrective(pendingLensCorrective)
-			st.queueCorrective(pendingRepeatCorrective)
-			st.queueCorrective(pendingReasoningCorrective)
+			st.queueCorrective(steers.lens)
+			st.queueCorrective(steers.repeat)
+			st.queueCorrective(steers.reasoning)
 			// A background job's outcome is invisible unless the model asks
 			// for it, so a server that died on startup reads the same as one
 			// serving happily. Surfaced once per job, through the same queue
@@ -4948,6 +4684,366 @@ func (loop *agentLoop) refuseIdenticalRetry(turn int, parsed ModelResponse, inte
 		return turnEnds
 	}
 	return turnContinues
+}
+
+// runToolCall takes a screened tool call through its last refusals and the
+// loop-health detectors, runs it and reports its result. It returns the result
+// and the correctives queued for the next turn. The outcome says whether the
+// turn goes on, ends, or ends the run; the error is then what runAgentLoop
+// returns.
+func (loop *agentLoop) runToolCall(turn int, parsed ModelResponse, intentArgs json.RawMessage) (*ToolResult, turnCorrectives, turnOutcome, error) {
+	ctx, st := loop.ctx, loop.st
+	var steers turnCorrectives
+	runawayWrite, outcome := loop.refuseBeforeDispatch(turn, parsed, intentArgs)
+	if outcome != turnContinues {
+		return nil, steers, outcome, nil
+	}
+	steers.repeat, outcome = loop.detectRepetition(turn, parsed, intentArgs, runawayWrite)
+	if outcome != turnContinues {
+		return nil, steers, outcome, nil
+	}
+	steers.reasoning = detectReasoningRepetition(ctx, turn)
+	lens, outcome, err := loop.scoreWithLens(turn, parsed)
+	if outcome != turnContinues {
+		return nil, steers, outcome, err
+	}
+	steers.lens = lens
+
+	// Execute tool. A re-read of an unchanged file already in
+	// context is served from a compact pointer instead of
+	// re-injecting + re-encoding the whole file (see
+	// redundantReadShortCircuit).
+	startTime := time.Now()
+	result, outcome, err := loop.dispatchToolCall(turn, parsed)
+	if outcome != turnContinues {
+		return nil, steers, outcome, err
+	}
+	elapsed := time.Since(startTime)
+
+	loop.recordCallResult(turn, parsed, intentArgs, result)
+	streamToolResult(ctx, st, parsed, result, elapsed)
+	// The lens stopped scoring inside this call (V3 reported it):
+	// the run ends here, saying why (lens_required.go).
+	if why := ctx.lensDownReason(); why != "" {
+		emitTerminal(ctx, st, TerminalFailed, "lens_unavailable",
+			lensUnavailableSummary(why, st.madeProductiveChange)+liveBackgroundJobNote(ctx))
+		return nil, steers, runEnds, nil
+	}
+	loop.markWarnedWrite(parsed, result)
+	loop.dischargeWarnedRuns(parsed, result)
+	return result, steers, turnContinues, nil
+}
+
+// turnCorrectives are the loop-health correctives one tool call queues for the
+// next turn: from the lens's quality crash, the repeated call and the rehashed
+// reasoning, drained in that order. Each holds at most one message.
+type turnCorrectives struct {
+	lens, repeat, reasoning string
+}
+
+// detectRepetition runs the tool-call repetition detector and returns the
+// corrective it queued for the next turn. The second detection ends the run,
+// unless the task's named deliverable is still missing: that earns one
+// output-rescue steer instead.
+//
+// Tool-call repetition detector. Catches the structural-loop
+// case the lens scoring doesn't see: same exact (tool, args)
+// emitted N times in close succession. Lens covers semantic
+// repetition (model produced the same low-quality content);
+// this covers structural repetition (model emitted the same
+// call to read_file or run_command). Fires before tool
+// execution so the corrective lands in the same iteration
+// as the lens corrective if both trigger.
+func (loop *agentLoop) detectRepetition(turn int, parsed ModelResponse, intentArgs json.RawMessage, runawayWrite bool) (string, turnOutcome) {
+	ctx, st := loop.ctx, loop.st
+	pendingRepeatCorrective := ""
+	if msg, _, repeating := recordToolCall(ctx, parsed.Name, intentArgs); repeating || runawayWrite {
+		if runawayWrite && !repeating {
+			msg = "You have rewritten this file an unusually large number of times without converging. Stop rewriting the whole file — read the current on-disk version, make ONE targeted change with edit_file/structural_edit, or step back and reconsider the approach; if the task is satisfied, respond with done."
+			// The detector clears its window only when IT fires.
+			// The backstop is a separate trigger for the same
+			// corrective, so clear it here too.
+			resetToolRepeatWindow(ctx)
+		}
+		log.Printf("[agent] tool-call repetition at turn %d on %s — queuing corrective for next turn", turn, parsed.Name)
+		ctx.Stream("agent_repeat_intervention", map[string]interface{}{
+			"turn":   turn,
+			"tool":   parsed.Name,
+			"reason": msg,
+		})
+		pendingRepeatCorrective = msg
+		loop.repeatDetections++
+		// Steer-before-kill ladder. On the FIRST detection, fall
+		// through: pendingRepeatCorrective is injected below and the
+		// loop continues, so the model gets an explicit nudge to
+		// change approach before we ever terminate. Only hard-stop
+		// on the SECOND detection — the model saw the steer and
+		// repeated anyway (genuinely stuck).
+		//
+		// The old code hard-stopped on the FIRST detection whenever
+		// st.madeProductiveChange was set ("work landed, model spinning
+		// on verification"). That mistook legitimate iteration for a
+		// loop: 2026-07-19 showed models one nudge from finishing
+		// — regex-chess repeating a verify command that itself had a
+		// syntax error, polyglot mid-fix — killed with their solution
+		// on disk but unverified. A nudge first is the whole point:
+		// the broken-verify steer (below) can turn exactly these into
+		// completions.
+		if loop.repeatDetections >= 2 {
+			// Output-rescue: if the task named a deliverable and it
+			// isn't on disk, the model is looping WITHOUT having
+			// committed its answer — steer toward the file once and
+			// keep going rather than hard-stopping empty-handed.
+			if missing := missingExpectedOutputs(ctx, st.expectedOutputs); len(missing) > 0 && !loop.outputRescueUsed {
+				loop.outputRescueUsed = true
+				loop.repeatDetections = 0
+				pendingRepeatCorrective = expectedOutputMissingMessage(missing)
+				log.Printf("[agent] repeat loop at turn %d but named deliverable(s) %v not on disk — output-rescue steer instead of stopping", turn, logPaths(missing))
+			} else {
+				log.Printf("[agent] second repetition detection at turn %d — stopping (productive_change_hint=%v)", turn, st.madeProductiveChange)
+				// The one terminal wired to recovery. It runs BEFORE
+				// the summary so the disclosure describes the bytes
+				// that are actually on disk when the run ends. It is
+				// a system action: no progress hint is set, no tool
+				// event is emitted, and the terminal stays stopped.
+				recovered := restoreSaferDeliverables(ctx)
+				loop.endStream(TerminalStopped, "repeat_detector",
+					repeatTerminalSummary(ctx, st.expectedOutputs,
+						st.madeProductiveChange, recovered))
+				return "", runEnds
+			}
+		}
+	}
+	return pendingRepeatCorrective, turnContinues
+}
+
+// detectReasoningRepetition watches the model's reasoning for the same opening
+// turn after turn, and returns the corrective it queued, or "".
+//
+// Reasoning-repetition detector (BiasBusters #30). The
+// model's reasoning_content stream is captured per-turn in
+// ctx.LastTurnReasoning by callLLMOnce. recordReasoning
+// compares the normalized opening prefix against the prior
+// turn's snippet; ≥2 consecutive identical openings fires
+// the intervention. Sibling to the structural repeat
+// detector (above) and the lens regression detector (below)
+// — three different angles on "model is stuck", catching
+// different shapes of stuck-ness.
+func detectReasoningRepetition(ctx *AgentContext, turn int) string {
+	pendingReasoningCorrective := ""
+	if msg, obs, repeating := recordReasoning(ctx, ctx.LastTurnReasoning); repeating {
+		log.Printf("[agent] reasoning repetition at turn %d (consecutive=%d) — queuing corrective", turn, obs.Count)
+		ctx.Stream("agent_reasoning_intervention", map[string]interface{}{
+			"turn":        turn,
+			"consecutive": obs.Count,
+			"reason":      msg,
+			"snippet":     obs.Snippet,
+		})
+		pendingReasoningCorrective = msg
+	}
+	return pendingReasoningCorrective
+}
+
+// scoreWithLens scores the content of a write_file or edit_file with the
+// geometric lens before it executes, and returns the corrective it queued on a
+// quality crash, or "". A lens that cannot score ends the run, and the error is
+// then what runAgentLoop returns.
+//
+// Score write_file/edit_file content with the geometric lens
+// BEFORE executing. The score reflects what the model produced
+// (independent of whether the tool succeeds). On a quality-crash pattern (N consecutive
+// low scores) we queue a corrective system message that gets
+// appended AFTER the tool result so the next LLM call sees:
+// assistant(tool_call) → tool(result) → system(lens warning).
+// This is the direct fix for the May 6 templates/resources.html
+// stub-loop case where the stub gate kept rejecting but the model
+// kept retrying the same stub.
+func (loop *agentLoop) scoreWithLens(turn int, parsed ModelResponse) (string, turnOutcome, error) {
+	ctx, st := loop.ctx, loop.st
+	pendingLensCorrective := ""
+	if scorable, ok := extractScorableContent(parsed.Name, parsed.Args); ok {
+		score, scored, down := scoreContentForAgent(ctx.Ctx, ctx.LensURL, scorable)
+		if down != "" {
+			return "", runEnds, st.stopLensDown(ctx, parsed.Name, down)
+		}
+		if scored {
+			ctx.LensScoreHistory = append(ctx.LensScoreHistory, score.Aggregate.GxScoreMin)
+			log.Printf("[agent] lens turn=%d tool=%s gx_min=%.3f gx_mean=%.3f off_rails=%d n_tok=%d latency=%.0fms history=%s",
+				turn, parsed.Name,
+				score.Aggregate.GxScoreMin, score.Aggregate.GxScoreMean,
+				score.Aggregate.FirstOffRailsIdx, score.NTokens,
+				score.LatencyMS, formatScoreSlice(ctx.LensScoreHistory))
+			ctx.Stream("agent_lens_score", map[string]interface{}{
+				"tool":                parsed.Name,
+				"turn":                turn,
+				"n_tokens":            score.NTokens,
+				"first_off_rails_idx": score.Aggregate.FirstOffRailsIdx,
+				"gx_score_min":        score.Aggregate.GxScoreMin,
+				"gx_score_mean":       score.Aggregate.GxScoreMean,
+				"latency_ms":          score.LatencyMS,
+			})
+			if low, severe, calibrated := score.calibratedThresholds(); calibrated {
+				if msg, intervene := agentLensRegression(ctx.LensScoreHistory, low, severe); intervene {
+					log.Printf("[agent] lens regression at turn %d on %s — queuing corrective for next turn", turn, parsed.Name)
+					ctx.Stream("agent_lens_intervention", map[string]interface{}{
+						"turn":   turn,
+						"tool":   parsed.Name,
+						"reason": msg,
+					})
+					pendingLensCorrective = msg
+					// Reset history so we don't re-fire on the same crash.
+					ctx.LensScoreHistory = nil
+				}
+			}
+		}
+	}
+	return pendingLensCorrective, turnContinues, nil
+}
+
+// dispatchToolCall runs the tool call, unless a re-read can be answered from
+// context or a re-run is held back until an edit lands. A deadline that lands
+// during the call ends the run; the error is then what runAgentLoop returns.
+func (loop *agentLoop) dispatchToolCall(turn int, parsed ModelResponse) (*ToolResult, turnOutcome, error) {
+	ctx, st := loop.ctx, loop.st
+	result := redundantReadShortCircuit(parsed.Name, parsed.Args, ctx)
+	if result != nil {
+		log.Printf("[agent] turn=%d short-circuited redundant read (already in context, unchanged)", turn)
+	}
+	if result == nil && (parsed.Name == "run_command" || parsed.Name == "run_background") {
+		if blk := runBlockAfterTraceback(ctx); blk != nil {
+			result = blk
+			log.Printf("[agent] turn=%d blocked re-run after traceback — forcing an edit first", turn)
+		}
+	}
+	if result == nil {
+		result = executeToolCall(parsed.Name, parsed.Args, ctx)
+		// The deadline can land in the middle of a tool call. Stop
+		// here rather than starting another turn on a dead context.
+		if ctx.Ctx != nil && ctx.Ctx.Err() != nil {
+			return nil, runEnds, finishCancelledRun(ctx, st, turn)
+		}
+		// Debt is settled from the ledger's own evidence, never from
+		// the call reporting that it worked.
+		settleMutationDebt(ctx, st)
+	}
+	return result, turnContinues, nil
+}
+
+// recordCallResult records a failed call for the re-send ban, answering a
+// second distinct rejected proposal in the same result, and clears what
+// earlier failures left once a call works.
+//
+// On failure, log the error so it shows up in `docker compose
+// logs atlas-proxy` without having to attach a debugger.
+func (loop *agentLoop) recordCallResult(turn int, parsed ModelResponse, intentArgs json.RawMessage, result *ToolResult) {
+	ctx, st := loop.ctx, loop.st
+	if !result.Success {
+		log.Printf("[agent] turn=%d tool=%q FAIL: %q", turn,
+			truncateStr(parsed.Name, 64), truncateStr(result.Error, 240))
+		recordFailedToolCall(ctx, parsed.Name,
+			retryIdentityArgs(parsed.Name, intentArgs, parsed.Args), result.Error)
+		// C4: a replacement refused while the file it targeted stayed
+		// valid. The second distinct proposal against one generation
+		// is the evidence that the refusal text alone is not landing,
+		// and the answer rides on the SAME result -- one call, one
+		// result, and the model reads it in the same message.
+		if key, sha, distinct := noteRejectedProposal(ctx, st, parsed.Name,
+			parsed.Args, result); distinct >= 2 {
+			rel := ledgerArgPath(parsed.Args, "path")
+			if msg := rejectedProposalRecovery(ctx, st, rel, key, sha); msg != "" {
+				result.Error += "\n\n" + msg
+			}
+		}
+	} else {
+		// A call can fail and later succeed — an edit rejected for a
+		// stale range works after a re-read. Drop the memory with the
+		// condition that caused it.
+		clearFailedToolCall(ctx, parsed.Name,
+			retryIdentityArgs(parsed.Name, intentArgs, parsed.Args))
+		clearSteerState(ctx, st, parsed.Name, parsed.Args)
+		clearBrokenArtifactState(ctx, st, parsed.Name, intentArgs)
+	}
+}
+
+// streamToolResult answers the tool call on both event streams.
+func streamToolResult(ctx *AgentContext, st *runState, parsed ModelResponse, result *ToolResult, elapsed time.Duration) {
+	st.pendingToolCall = ""
+	ctx.Stream("tool_result", map[string]interface{}{
+		"tool":    parsed.Name,
+		"success": result.Success,
+		"data":    json.RawMessage(result.Data),
+		"error":   result.Error,
+		"elapsed": elapsed.String(),
+	})
+	Emit(Envelope{
+		EventID:    NewEventID(),
+		Timestamp:  float64(time.Now().UnixNano()) / 1e9,
+		Type:       EvtToolResult,
+		Stage:      "tool",
+		DurationMS: elapsed.Milliseconds(),
+		Payload: map[string]interface{}{
+			"name":    parsed.Name,
+			"success": result.Success,
+			"error":   truncateStr(result.Error, 120),
+		},
+	})
+}
+
+// markWarnedWrite marks a landed write_file whose result carries a parse
+// warning as never run, and clears the mark of a clean one.
+//
+// A landed write whose result carries a parse warning is pending
+// execution; a landed clean write clears its own pending mark.
+func (loop *agentLoop) markWarnedWrite(parsed ModelResponse, result *ToolResult) {
+	ctx, st := loop.ctx, loop.st
+	if result.Success && parsed.Name == "write_file" {
+		var wf WriteFileInput
+		if json.Unmarshal(parsed.Args, &wf) == nil {
+			var out WriteFileOutput
+			warned := json.Unmarshal(result.Data, &out) == nil && out.Warning != ""
+			st.markWarnedRun(ctx, wf.Path, warned)
+		}
+	}
+}
+
+// dischargeWarnedRuns clears the warned marks of the files a run_command or
+// run_background attempted to execute, and settles the content debt that a
+// clean execution demonstrates.
+func (loop *agentLoop) dischargeWarnedRuns(parsed ModelResponse, result *ToolResult) {
+	ctx, st := loop.ctx, loop.st
+	if (parsed.Name == "run_command" || parsed.Name == "run_background") && result != nil {
+		// Discharge only the marks this command actually attempted to
+		// EXECUTE. Two prior rules both failed an audit: clearing on
+		// any command let `ls` bless a warned file, and clearing on a
+		// filename substring let `cat solve.py` or `grep main solve.py`
+		// do the same — naming a file is not running it. The mark is
+		// "this version has never been executed"; only an execution
+		// attempt (interpreter invocation or ./file) changes that fact,
+		// and the attempt itself suffices — pass or fail, the model has
+		// now seen the real runtime behavior.
+		//
+		// run_background is an execution attempt too. A server script
+		// is redirected there by the foreground gate, and its settle
+		// window returns the same traceback run_command would; a mark
+		// that only run_command could discharge left the file
+		// permanently "never run" (observed 2026-09-14: the model ran
+		// app.py in the background, read the SyntaxError, and had its
+		// fix refused for not having run the file).
+		var rc struct {
+			Command string `json:"command"`
+		}
+		if json.Unmarshal(parsed.Args, &rc) == nil {
+			for p := range st.pendingWarnedRun {
+				if executionAttempt(rc.Command, p) {
+					delete(st.pendingWarnedRun, p)
+				}
+			}
+			// A clean execution is the strongest demonstration a file
+			// can get, and it settles the content debt the parse-based
+			// routes never reached.
+			settleDebtByExecution(ctx, st, rc.Command, executionSucceeded(parsed.Name, result))
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
