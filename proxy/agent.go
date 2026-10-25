@@ -1213,7 +1213,6 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 	// reproduce old_str byte-for-byte). This counter survives interleaved
 	// reads so we can force the structural_edit steer after the second miss.
 	editMissByPath := map[string]int{}
-	const runawayWriteThreshold = 20
 	// THE output-obligation decision, made once, from the contract the
 	// request boundary already validated. Nothing the model emits later can
 	// change which source spoke.
@@ -1745,82 +1744,12 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				}
 			}
 
-			// Shell-op guardrail: bounce destructive filesystem verbs in
-			// run_command. The native edit_file/write_file/delete_file
-			// tools are the supported mutation path — they go through
-			// V3, the surgical-edit gate, and audit logging. Shell `mv`,
-			// `rm`, `cp`, `find -delete` bypass all of that and led to
-			// today's "agent moved templates into venv mid-task" disaster.
-			// Yolo mode opts out of this for users who want the model to
-			// have free rein.
-			// The foreground-server redirect runs in EVERY mode. Yolo opts out
-			// of the shell-mutation and working-dir gates — those are
-			// permission questions, and yolo is the user saying don't ask.
-			// Starting a server in the foreground is not a permission
-			// question: it burns the sandbox timeout and reports a failure
-			// that says nothing about the code, whatever mode you are in.
-			if parsed.Name == "run_command" {
-				var rc RunCommandInput
-				if json.Unmarshal(parsed.Args, &rc) == nil {
-					if rejection := foregroundServerRejectionWithSource(rc.Command,
-						workspaceFileReader(ctx)); rejection != "" {
-						log.Printf("[agent] redirecting a foreground server start to run_background: %q",
-							truncateStr(rc.Command, 80))
-						st.bounceToolCall(ctx, "run_command", rejection)
-						// Counted like every other refusal, so a model that
-						// re-sends it meets the identical-retry refusal and the
-						// failure bounds. Measured: 20 identical re-sends, each
-						// bounced, until the session deadline.
-						if loop.accountRefusedCall(parsed.Name, intentArgs, rejection,
-							workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
-							return nil
-						}
-						continue
-					}
-				}
-			}
-			if parsed.Name == "run_command" && !ctx.YoloMode {
-				var rc RunCommandInput
-				if json.Unmarshal(parsed.Args, &rc) == nil {
-					if rejection := validateRunCommand(rc.Command, ctx.WorkingDir); rejection != "" {
-						// %q on rejection too: validateRunCommand may embed
-						// fragments of the user's command verbatim in its
-						// reason string (go/log-injection).
-						log.Printf("[agent] rejecting run_command %q: %q",
-							truncateStr(rc.Command, 80), rejection)
-						st.bounceToolCall(ctx, "run_command", rejection)
-						if loop.accountRefusedCall(parsed.Name, intentArgs, rejection,
-							workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
-							return nil
-						}
-						continue
-					}
-				}
-			}
-
-			// Same shell-validation + working-dir gate for run_background.
-			// Without this, the May 8 2026 phantom-/workspace drift went
-			// unblocked: the surgical-edit gate covered run_command but
-			// run_background sailed through, so `run_background "cd
-			// /workspace && python app.py"` looped for 3 turns before the
-			// repeat detector caught it. validateRunCommand chains both
-			// gates so destructive shell verbs and /workspace drift get
-			// the same treatment regardless of which run_* tool the model
-			// picks.
-			if parsed.Name == "run_background" && !ctx.YoloMode {
-				var rb RunBackgroundInput
-				if json.Unmarshal(parsed.Args, &rb) == nil {
-					if rejection := validateRunCommand(rb.Command, ctx.WorkingDir); rejection != "" {
-						log.Printf("[agent] rejecting run_background %q: %q",
-							truncateStr(rb.Command, 80), rejection)
-						st.bounceToolCall(ctx, "run_background", rejection)
-						if loop.accountRefusedCall(parsed.Name, intentArgs, rejection,
-							workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
-							return nil
-						}
-						continue
-					}
-				}
+			runawayWrite, refused := loop.refuseBeforeDispatch(turn, parsed, intentArgs)
+			switch refused {
+			case turnEnds:
+				continue
+			case runEnds:
+				return nil
 			}
 
 			// Tool-call repetition detector. Catches the structural-loop
@@ -1832,130 +1761,6 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 			// execution so the corrective lands in the same iteration
 			// as the lens corrective if both trigger.
 			pendingRepeatCorrective := ""
-			// Runaway backstop (#147 review #14): count writes per path and
-			// force the repeat path once a single file is rewritten far more
-			// than any real iteration would.
-			runawayWrite := false
-			if parsed.Name == "write_file" {
-				if wp := writeFilePath(parsed.Args); wp != "" {
-					loop.writeCountByPath[wp]++
-					if loop.writeCountByPath[wp] == runawayWriteThreshold {
-						runawayWrite = true
-						log.Printf("[agent] runaway write backstop: %q rewritten %d times — escalating", wp, loop.writeCountByPath[wp])
-					}
-				}
-			}
-			// A tool the loop has taken away for this file stays taken away.
-			// Enforced before the identical-resend check so a model that
-			// varies one byte cannot walk around the ban.
-			if p := extractFailurePath(parsed.Name, parsed.Args); p != "" &&
-				st.toolBanned[parsed.Name+"\x00"+p] {
-				log.Printf("[agent] turn=%d blocked %s on %s (tool withdrawn for this file)", turn, parsed.Name, p)
-				st.bounceToolCall(ctx, parsed.Name, toolBanNoteFor(ctx, parsed.Name, p))
-				loop.consecutiveErrors++
-				loop.totalFailures++
-				// A bounce off the ban is a failure like any other. This
-				// branch incremented the counters and then continued without
-				// reading them, so the ceiling could not end a session that
-				// only ever bounced here — measured at 19 and 85 bounces.
-				ctx.RecentFailurePaths = appendRecentFailurePath(ctx.RecentFailurePaths, p)
-				if shouldStopForFailures(loop.totalFailures, loop.consecutiveErrors, ctx.RecentFailurePaths) {
-					log.Printf("[agent] breaking at turn %d: %d refused/failed calls, %d consecutive on %q",
-						turn, loop.totalFailures, loop.consecutiveErrors, p)
-					loop.endStream(TerminalStopped, "repeated_refusal",
-						repeatedRefusalSummary(parsed.Name, p, st.madeProductiveChange)+liveBackgroundJobNote(ctx))
-					return nil
-				}
-				continue
-			}
-			// Refuse an exact re-send of an already-rejected call before it
-			// executes. Checked ahead of the repetition detector because that
-			// one needs three occurrences and only steers the NEXT turn,
-			// which a two-turn identical pair never reaches.
-			// Same representation the repeat detector uses, for the same
-			// reason: a fenced re-send is byte-identical as the model wrote
-			// it and different only in the body the channel fetched for it.
-			// The lookup, the record and the clear all key on the intent, or
-			// they key on three different things and never meet.
-			// C4: this exact replacement was already refused against the
-			// bytes still on disk. It has to be answered BEFORE the resend
-			// ban, which would otherwise end the run with the model never
-			// having been shown the file it keeps trying to replace.
-			if sha := resolvedProposalHash(parsed.Name, parsed.Args); sha != "" {
-				rel := ledgerArgPath(parsed.Args, "path")
-				if canon, diskHash := survivingKnownGood(ctx, rel); canon != "" {
-					if ev := st.c4Rejected[canon]; ev != nil && ev.diskHash == diskHash {
-						if _, already := ev.diagnostics[sha]; already {
-							if msg := rejectedProposalRecovery(ctx, st, rel, canon, sha); msg != "" {
-								st.bounceToolCall(ctx, parsed.Name, msg)
-								if loop.accountRefusedCall(parsed.Name, intentArgs, msg,
-									workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
-									return nil
-								}
-								continue
-							}
-						}
-					}
-				}
-			}
-
-			// C3: the no-op edit over an artifact already shown to be broken.
-			// This has to come BEFORE the identical-resend ban, which would
-			// otherwise intercept the recurrence and end the run with the
-			// broken file still on disk -- the retained shape exactly.
-			if relPath := noopEditIntent(parsed.Name, intentArgs); relPath != "" {
-				if msg := brokenArtifactRecovery(ctx, st, relPath); msg != "" {
-					st.bounceToolCall(ctx, parsed.Name, msg)
-					// Counted once, here. The call never reaches the tool, so
-					// no post-execution accounting runs for it, and the ban
-					// below is skipped by the continue.
-					if loop.accountRefusedCall(parsed.Name, intentArgs, msg,
-						workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
-						return nil
-					}
-					continue
-				}
-			}
-			if refusal := identicalRetryRefusal(ctx, parsed.Name,
-				retryIdentityArgs(parsed.Name, intentArgs, parsed.Args)); refusal != "" {
-				log.Printf("[agent] turn=%d refusing an identical re-send of a rejected %s", turn, parsed.Name)
-				// Escalate from refusing THIS call to removing the tool for
-				// THIS file. The model has now sent the same rejected call
-				// twice, so a third refusal buys another identical turn.
-				if p := extractFailurePath(parsed.Name, parsed.Args); p != "" {
-					if st.toolBanned == nil {
-						st.toolBanned = map[string]bool{}
-					}
-					key := parsed.Name + "\x00" + p
-					if !st.toolBanned[key] {
-						st.toolBanned[key] = true
-						log.Printf("[agent] %s is now unavailable for %s — identical rejected call re-sent", parsed.Name, p)
-					}
-					refusal += " " + toolBanNoteFor(ctx, parsed.Name, p)
-				}
-				st.bounceToolCall(ctx, parsed.Name, refusal)
-				// A refusal is a failure and has to count as one. Skipping
-				// the counters would leave a model that spams one rejected
-				// call running to the turn cap with nothing to stop it — the
-				// refusal returns before both the repetition window and the
-				// error counter, so neither breaker would ever see it.
-				loop.consecutiveErrors++
-				loop.totalFailures++
-				failPath := extractFailurePath(parsed.Name, parsed.Args)
-				ctx.RecentFailurePaths = appendRecentFailurePath(ctx.RecentFailurePaths, failPath)
-				// ...and the same stopping rules have to apply here. Both the
-				// ceiling and the path-aware breaker live inside the
-				// post-execution failure branch, which this path skips, so
-				// incrementing alone left the counters with no reader.
-				if shouldStopForFailures(loop.totalFailures, loop.consecutiveErrors, ctx.RecentFailurePaths) {
-					log.Printf("[agent] breaking at turn %d: %d refused/failed calls, %d consecutive on %q",
-						turn, loop.totalFailures, loop.consecutiveErrors, ctx.RecentFailurePaths[len(ctx.RecentFailurePaths)-1])
-					loop.endStream(TerminalStopped, "repeated_refusal",
-						repeatedRefusalSummary(parsed.Name, failPath, st.madeProductiveChange)+liveBackgroundJobNote(ctx))
-					return nil
-				}
-				continue
-			}
 			if msg, _, repeating := recordToolCall(ctx, parsed.Name, intentArgs); repeating || runawayWrite {
 				if runawayWrite && !repeating {
 					msg = "You have rewritten this file an unusually large number of times without converging. Stop rewriting the whole file — read the current on-disk version, make ONE targeted change with edit_file/structural_edit, or step back and reconsider the approach; if the task is satisfied, respond with done."
@@ -4704,6 +4509,303 @@ func (loop *agentLoop) endOnText(turn int, parsed ModelResponse) bool {
 	}
 	emitTerminal(ctx, st, textStatus, textReason, textSummary)
 	return true
+}
+
+// refuseBeforeDispatch runs the last gates before a tool call executes: the
+// shell gates, the runaway-write count, the per-file tool ban, the answers to
+// a repeated rejected proposal or a repeated no-op edit, and the identical
+// re-send ban. It reports whether this call is a runaway write, and the outcome.
+func (loop *agentLoop) refuseBeforeDispatch(turn int, parsed ModelResponse, intentArgs json.RawMessage) (bool, turnOutcome) {
+	if outcome := loop.redirectForegroundServer(parsed, intentArgs); outcome != turnContinues {
+		return false, outcome
+	}
+	if outcome := loop.refuseUnsafeRunCommand(parsed, intentArgs); outcome != turnContinues {
+		return false, outcome
+	}
+	if outcome := loop.refuseUnsafeRunBackground(parsed, intentArgs); outcome != turnContinues {
+		return false, outcome
+	}
+	runawayWrite := loop.countWholeFileWrites(parsed)
+	if outcome := loop.refuseBannedTool(turn, parsed); outcome != turnContinues {
+		return runawayWrite, outcome
+	}
+	if outcome := loop.answerRejectedProposal(parsed, intentArgs); outcome != turnContinues {
+		return runawayWrite, outcome
+	}
+	if outcome := loop.answerBrokenArtifact(parsed, intentArgs); outcome != turnContinues {
+		return runawayWrite, outcome
+	}
+	return runawayWrite, loop.refuseIdenticalRetry(turn, parsed, intentArgs)
+}
+
+// redirectForegroundServer refuses a run_command that would start a server in
+// the foreground and points the model at run_background.
+//
+// The foreground-server redirect runs in EVERY mode. Yolo opts out
+// of the shell-mutation and working-dir gates — those are
+// permission questions, and yolo is the user saying don't ask.
+// Starting a server in the foreground is not a permission
+// question: it burns the sandbox timeout and reports a failure
+// that says nothing about the code, whatever mode you are in.
+func (loop *agentLoop) redirectForegroundServer(parsed ModelResponse, intentArgs json.RawMessage) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	if parsed.Name == "run_command" {
+		var rc RunCommandInput
+		if json.Unmarshal(parsed.Args, &rc) == nil {
+			if rejection := foregroundServerRejectionWithSource(rc.Command,
+				workspaceFileReader(ctx)); rejection != "" {
+				log.Printf("[agent] redirecting a foreground server start to run_background: %q",
+					truncateStr(rc.Command, 80))
+				st.bounceToolCall(ctx, "run_command", rejection)
+				// Counted like every other refusal, so a model that
+				// re-sends it meets the identical-retry refusal and the
+				// failure bounds. Measured: 20 identical re-sends, each
+				// bounced, until the session deadline.
+				if loop.accountRefusedCall(parsed.Name, intentArgs, rejection,
+					workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
+					return runEnds
+				}
+				return turnEnds
+			}
+		}
+	}
+	return turnContinues
+}
+
+// refuseUnsafeRunCommand refuses a run_command the shell validator rejects.
+//
+// Shell-op guardrail: bounce destructive filesystem verbs in
+// run_command. The native edit_file/write_file/delete_file
+// tools are the supported mutation path — they go through
+// V3, the surgical-edit gate, and audit logging. Shell `mv`,
+// `rm`, `cp`, `find -delete` bypass all of that and led to
+// today's "agent moved templates into venv mid-task" disaster.
+// Yolo mode opts out of this for users who want the model to
+// have free rein.
+func (loop *agentLoop) refuseUnsafeRunCommand(parsed ModelResponse, intentArgs json.RawMessage) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	if parsed.Name == "run_command" && !ctx.YoloMode {
+		var rc RunCommandInput
+		if json.Unmarshal(parsed.Args, &rc) == nil {
+			if rejection := validateRunCommand(rc.Command, ctx.WorkingDir); rejection != "" {
+				// %q on rejection too: validateRunCommand may embed
+				// fragments of the user's command verbatim in its
+				// reason string (go/log-injection).
+				log.Printf("[agent] rejecting run_command %q: %q",
+					truncateStr(rc.Command, 80), rejection)
+				st.bounceToolCall(ctx, "run_command", rejection)
+				if loop.accountRefusedCall(parsed.Name, intentArgs, rejection,
+					workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
+					return runEnds
+				}
+				return turnEnds
+			}
+		}
+	}
+	return turnContinues
+}
+
+// refuseUnsafeRunBackground refuses a run_background the shell validator
+// rejects.
+//
+// Same shell-validation + working-dir gate for run_background.
+// Without this, the May 8 2026 phantom-/workspace drift went
+// unblocked: the surgical-edit gate covered run_command but
+// run_background sailed through, so `run_background "cd
+// /workspace && python app.py"` looped for 3 turns before the
+// repeat detector caught it. validateRunCommand chains both
+// gates so destructive shell verbs and /workspace drift get
+// the same treatment regardless of which run_* tool the model
+// picks.
+func (loop *agentLoop) refuseUnsafeRunBackground(parsed ModelResponse, intentArgs json.RawMessage) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	if parsed.Name == "run_background" && !ctx.YoloMode {
+		var rb RunBackgroundInput
+		if json.Unmarshal(parsed.Args, &rb) == nil {
+			if rejection := validateRunCommand(rb.Command, ctx.WorkingDir); rejection != "" {
+				log.Printf("[agent] rejecting run_background %q: %q",
+					truncateStr(rb.Command, 80), rejection)
+				st.bounceToolCall(ctx, "run_background", rejection)
+				if loop.accountRefusedCall(parsed.Name, intentArgs, rejection,
+					workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
+					return runEnds
+				}
+				return turnEnds
+			}
+		}
+	}
+	return turnContinues
+}
+
+// countWholeFileWrites counts each write_file per path, and reports whether
+// this one is the write that reaches the runaway threshold.
+//
+// Runaway backstop (#147 review #14): count writes per path and
+// force the repeat path once a single file is rewritten far more
+// than any real iteration would.
+func (loop *agentLoop) countWholeFileWrites(parsed ModelResponse) bool {
+	const runawayWriteThreshold = 20
+	runawayWrite := false
+	if parsed.Name == "write_file" {
+		if wp := writeFilePath(parsed.Args); wp != "" {
+			loop.writeCountByPath[wp]++
+			if loop.writeCountByPath[wp] == runawayWriteThreshold {
+				runawayWrite = true
+				log.Printf("[agent] runaway write backstop: %q rewritten %d times — escalating", wp, loop.writeCountByPath[wp])
+			}
+		}
+	}
+	return runawayWrite
+}
+
+// refuseBannedTool refuses a tool the loop has taken away for this file.
+//
+// A tool the loop has taken away for this file stays taken away.
+// Enforced before the identical-resend check so a model that
+// varies one byte cannot walk around the ban.
+func (loop *agentLoop) refuseBannedTool(turn int, parsed ModelResponse) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	if p := extractFailurePath(parsed.Name, parsed.Args); p != "" &&
+		st.toolBanned[parsed.Name+"\x00"+p] {
+		log.Printf("[agent] turn=%d blocked %s on %s (tool withdrawn for this file)", turn, parsed.Name, p)
+		st.bounceToolCall(ctx, parsed.Name, toolBanNoteFor(ctx, parsed.Name, p))
+		loop.consecutiveErrors++
+		loop.totalFailures++
+		// A bounce off the ban is a failure like any other. This
+		// branch incremented the counters and then continued without
+		// reading them, so the ceiling could not end a session that
+		// only ever bounced here — measured at 19 and 85 bounces.
+		ctx.RecentFailurePaths = appendRecentFailurePath(ctx.RecentFailurePaths, p)
+		if shouldStopForFailures(loop.totalFailures, loop.consecutiveErrors, ctx.RecentFailurePaths) {
+			log.Printf("[agent] breaking at turn %d: %d refused/failed calls, %d consecutive on %q",
+				turn, loop.totalFailures, loop.consecutiveErrors, p)
+			loop.endStream(TerminalStopped, "repeated_refusal",
+				repeatedRefusalSummary(parsed.Name, p, st.madeProductiveChange)+liveBackgroundJobNote(ctx))
+			return runEnds
+		}
+		return turnEnds
+	}
+	return turnContinues
+}
+
+// answerRejectedProposal finds a replacement that was already refused against
+// the bytes still on disk, and answers it before the re-send ban can.
+//
+// C4: this exact replacement was already refused against the
+// bytes still on disk. It has to be answered BEFORE the resend
+// ban, which would otherwise end the run with the model never
+// having been shown the file it keeps trying to replace.
+func (loop *agentLoop) answerRejectedProposal(parsed ModelResponse, intentArgs json.RawMessage) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	if sha := resolvedProposalHash(parsed.Name, parsed.Args); sha != "" {
+		rel := ledgerArgPath(parsed.Args, "path")
+		if canon, diskHash := survivingKnownGood(ctx, rel); canon != "" {
+			if ev := st.c4Rejected[canon]; ev != nil && ev.diskHash == diskHash {
+				if _, already := ev.diagnostics[sha]; already {
+					return loop.refuseRepeatedProposal(parsed, intentArgs, rel, canon, sha)
+				}
+			}
+		}
+	}
+	return turnContinues
+}
+
+// refuseRepeatedProposal shows the model the file its repeated replacement was
+// refused against, and counts the refusal. It goes on when there is nothing
+// to show.
+func (loop *agentLoop) refuseRepeatedProposal(parsed ModelResponse, intentArgs json.RawMessage, rel, canon, sha string) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	if msg := rejectedProposalRecovery(ctx, st, rel, canon, sha); msg != "" {
+		st.bounceToolCall(ctx, parsed.Name, msg)
+		if loop.accountRefusedCall(parsed.Name, intentArgs, msg,
+			workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
+			return runEnds
+		}
+		return turnEnds
+	}
+	return turnContinues
+}
+
+// answerBrokenArtifact answers a no-op edit over a file already shown to be
+// broken, before the re-send ban can.
+//
+// C3: the no-op edit over an artifact already shown to be broken.
+// This has to come BEFORE the identical-resend ban, which would
+// otherwise intercept the recurrence and end the run with the
+// broken file still on disk -- the retained shape exactly.
+func (loop *agentLoop) answerBrokenArtifact(parsed ModelResponse, intentArgs json.RawMessage) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	if relPath := noopEditIntent(parsed.Name, intentArgs); relPath != "" {
+		if msg := brokenArtifactRecovery(ctx, st, relPath); msg != "" {
+			st.bounceToolCall(ctx, parsed.Name, msg)
+			// Counted once, here. The call never reaches the tool, so
+			// no post-execution accounting runs for it, and the ban
+			// below is skipped by the continue.
+			if loop.accountRefusedCall(parsed.Name, intentArgs, msg,
+				workspaceRefusalPath(ctx, parsed.Name, parsed.Args)) {
+				return runEnds
+			}
+			return turnEnds
+		}
+	}
+	return turnContinues
+}
+
+// refuseIdenticalRetry refuses an exact re-send of a call already rejected,
+// takes the tool away for that file, and counts the refusal.
+//
+// Refuse an exact re-send of an already-rejected call before it
+// executes. Checked ahead of the repetition detector because that
+// one needs three occurrences and only steers the NEXT turn,
+// which a two-turn identical pair never reaches.
+// Same representation the repeat detector uses, for the same
+// reason: a fenced re-send is byte-identical as the model wrote
+// it and different only in the body the channel fetched for it.
+// The lookup, the record and the clear all key on the intent, or
+// they key on three different things and never meet.
+func (loop *agentLoop) refuseIdenticalRetry(turn int, parsed ModelResponse, intentArgs json.RawMessage) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	if refusal := identicalRetryRefusal(ctx, parsed.Name,
+		retryIdentityArgs(parsed.Name, intentArgs, parsed.Args)); refusal != "" {
+		log.Printf("[agent] turn=%d refusing an identical re-send of a rejected %s", turn, parsed.Name)
+		// Escalate from refusing THIS call to removing the tool for
+		// THIS file. The model has now sent the same rejected call
+		// twice, so a third refusal buys another identical turn.
+		if p := extractFailurePath(parsed.Name, parsed.Args); p != "" {
+			if st.toolBanned == nil {
+				st.toolBanned = map[string]bool{}
+			}
+			key := parsed.Name + "\x00" + p
+			if !st.toolBanned[key] {
+				st.toolBanned[key] = true
+				log.Printf("[agent] %s is now unavailable for %s — identical rejected call re-sent", parsed.Name, p)
+			}
+			refusal += " " + toolBanNoteFor(ctx, parsed.Name, p)
+		}
+		st.bounceToolCall(ctx, parsed.Name, refusal)
+		// A refusal is a failure and has to count as one. Skipping
+		// the counters would leave a model that spams one rejected
+		// call running to the turn cap with nothing to stop it — the
+		// refusal returns before both the repetition window and the
+		// error counter, so neither breaker would ever see it.
+		loop.consecutiveErrors++
+		loop.totalFailures++
+		failPath := extractFailurePath(parsed.Name, parsed.Args)
+		ctx.RecentFailurePaths = appendRecentFailurePath(ctx.RecentFailurePaths, failPath)
+		// ...and the same stopping rules have to apply here. Both the
+		// ceiling and the path-aware breaker live inside the
+		// post-execution failure branch, which this path skips, so
+		// incrementing alone left the counters with no reader.
+		if shouldStopForFailures(loop.totalFailures, loop.consecutiveErrors, ctx.RecentFailurePaths) {
+			log.Printf("[agent] breaking at turn %d: %d refused/failed calls, %d consecutive on %q",
+				turn, loop.totalFailures, loop.consecutiveErrors, ctx.RecentFailurePaths[len(ctx.RecentFailurePaths)-1])
+			loop.endStream(TerminalStopped, "repeated_refusal",
+				repeatedRefusalSummary(parsed.Name, failPath, st.madeProductiveChange)+liveBackgroundJobNote(ctx))
+			return runEnds
+		}
+		return turnEnds
+	}
+	return turnContinues
 }
 
 // ---------------------------------------------------------------------------
