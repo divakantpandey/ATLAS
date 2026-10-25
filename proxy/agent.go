@@ -1222,327 +1222,12 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 	st := loop.st
 
 	for turn := 0; ctx.MaxTurns <= 0 || turn < ctx.MaxTurns; turn++ {
-		st.turn = turn
-		// Budget hint — only relevant when there IS a turn cap.
-		// May 10 2026: T1/T2/T3 default to uncapped (ctx.MaxTurns == 0),
-		// so the hint is mostly dormant unless an operator explicitly
-		// sets ATLAS_MAX_TURNS. T0 still hits a hint at turn 4 if a
-		// conversational request unexpectedly tries to loop.
-		if !loop.budgetHintFired && ctx.MaxTurns > 0 && turn > 0 && turn*5 >= ctx.MaxTurns*4 {
-			loop.budgetHintFired = true
-			ctx.Messages = append(ctx.Messages, AgentMessage{
-				Role: "system",
-				Content: fmt.Sprintf(
-					"Turn budget notice: you're at turn %d of %d. If significant work remains, prioritize finishing the highest-impact items and verifying them — do not start new exploration. If you can finish in the remaining turns, keep going. If you cannot, summarize what's done and what's not in your `done` summary so the user knows what to follow up on.",
-					turn, ctx.MaxTurns),
-			})
-		}
-
-		// Bail out fast if the upstream request was cancelled (the client closed the
-		// connection, user hit Ctrl-C, terminal exited). Without this check the
-		// loop would keep grinding LLM calls and tool work for a client that's
-		// already gone, burning GPU.
-		if ctx.Ctx != nil {
-			select {
-			case <-ctx.Ctx.Done():
-				return finishCancelledRun(ctx, st, turn)
-			default:
-			}
-		}
-
-		// Trim conversation history if it gets too long (prevent context overflow).
-		// Keep system + most-recent-user-instruction + last 8 messages.
-		//
-		// Pinning the most recent user message is critical: long agent loops
-		// (5+ tool calls) push the user's task beyond the trim window, and
-		// the next LLM call sees only system + tool exchanges. Model has no
-		// instruction to work from and goes generic ("Hi! I'm ATLAS...").
-		// Hardcoding ctx.Messages[1] as the user msg used to work, but
-		// PriorHistory makes that index a prior-turn message instead — so
-		// scan backwards for the actual current-turn user role.
-		// Trim by TOKEN BUDGET, not a blind message count. The
-		// old `> 12 messages → keep 8` rule dropped a just-read file after
-		// a couple of turns even when the prompt was a fraction of the
-		// context window — the model would then re-read in a loop, saying
-		// "I don't see the output in the history". keepLast is now derived
-		// from how many recent messages actually fit the per-slot budget,
-		// floored at 8 so we never trim more aggressively than before.
-		trimmed := false
-		if keep := budgetedKeepLast(ctx.Messages); keep < len(ctx.Messages)-1 {
-			ctx.Messages = trimMessages(ctx.Messages, keep)
-			trimmed = true
-			log.Printf("[agent] trimmed conversation to %d messages (token-budget)", len(ctx.Messages))
-		}
-
-		// Per-turn streaming visibility: announce the start of the turn,
-		// then the LLM call boundaries. Without these the TUI sees a 10-30s
-		// gap between tool_result and the next tool_call while the model
-		// is generating — looks like a hang.
-		ctx.Stream("turn_start", map[string]interface{}{
-			"turn":     turn,
-			"messages": len(ctx.Messages),
-			"trimmed":  trimmed,
-		})
-		// Estimate prompt tokens up front (chars/4 — works for English
-		// + code, off by maybe 10–20%) so the TUI can pre-fill its
-		// context-utilization gauge while llama-server is still doing
-		// prompt eval. Authoritative count arrives in llm_call_end.
-		promptTokenEst := 0
-		for _, mm := range ctx.Messages {
-			promptTokenEst += len(mm.Content) / 4
-		}
-		ctx.Stream("llm_call_start", map[string]interface{}{
-			"turn":          turn,
-			"messages":      len(ctx.Messages),
-			"prompt_tokens": promptTokenEst,
-		})
-		Emit(NewEnvelope(EvtStageStart, "llm",
-			map[string]interface{}{"turn": turn, "messages": len(ctx.Messages)}))
-		llmStart := time.Now()
-
-		// Call LLM with grammar constraint
-		response, tokens, err := callLLMConstrained(ctx)
-		llmElapsed := time.Since(llmStart)
-		if err != nil {
-			ctx.Stream("llm_call_end", map[string]interface{}{
-				"turn":         turn,
-				"tokens":       0,
-				"total_tokens": ctx.TotalTokens,
-				"ms":           llmElapsed.Milliseconds(),
-				"error":        err.Error(),
-			})
-			Emit(Envelope{
-				EventID:    NewEventID(),
-				Timestamp:  float64(time.Now().UnixNano()) / 1e9,
-				Type:       EvtStageEnd,
-				Stage:      "llm",
-				DurationMS: llmElapsed.Milliseconds(),
-				Payload: map[string]interface{}{
-					"success": false, "error": err.Error(),
-				},
-			})
-			Emit(NewEnvelope(EvtError, "llm",
-				map[string]interface{}{"message": err.Error()}))
-			ctx.Stream("error", map[string]string{"error": err.Error()})
-			// A call that failed BECAUSE the work context ended is not an
-			// inference failure: the deadline is ours, and reporting the
-			// symptom would hide the cause and skip finalisation.
-			if ctx.Ctx != nil && ctx.Ctx.Err() != nil {
-				return finishCancelledRun(ctx, st, turn)
-			}
-			// An `error` event is not an outcome. This exit streamed one and
-			// returned, so the client saw a tool call, an error, and then
-			// nothing — aoc_sonar died here in BOTH reps on a context-size
-			// 400 and the user got silence. Every other exit in this loop
-			// authors a `done`; this one has to as well, or the failure is
-			// invisible to anything rendering the stream.
-			emitTerminal(ctx, st, TerminalFailed, "inference_failed",
-				inferenceFailureSummary(err, st.madeProductiveChange)+liveBackgroundJobNote(ctx))
-			return fmt.Errorf("LLM call failed on turn %d: %w", turn, err)
-		}
-		ctx.TotalTokens += tokens
-		st.response = response
-		ctx.Stream("llm_call_end", map[string]interface{}{
-			"turn":         turn,
-			"tokens":       tokens,
-			"total_tokens": ctx.TotalTokens,
-			"ms":           llmElapsed.Milliseconds(),
-			"chars":        len(response),
-		})
-		Emit(Envelope{
-			EventID:    NewEventID(),
-			Timestamp:  float64(time.Now().UnixNano()) / 1e9,
-			Type:       EvtStageEnd,
-			Stage:      "llm",
-			DurationMS: llmElapsed.Milliseconds(),
-			Payload: map[string]interface{}{
-				"success":      true,
-				"tokens":       tokens,
-				"total_tokens": ctx.TotalTokens,
-			},
-		})
-		Emit(NewEnvelope(EvtMetric, "llm", map[string]interface{}{
-			"name": "total_tokens", "value": ctx.TotalTokens,
-		}))
-
-		// Parse the response — extract JSON even if model added surrounding text
-		parsed, parseErr := extractModelResponse(response)
-		if parseErr != nil {
-			// Classify the failure shape once: a category for the log so
-			// docker logs reads "what kind of broken" at a glance, and
-			// targeted feedback for the model — generic "your response
-			// wasn't JSON" led to the May 2026 user-session bug where the
-			// model retried the same 1100-char edit_file with a giant
-			// old_str 5 times in a row. The response was being truncated
-			// at the llama-server token cap; the model couldn't see that
-			// and kept emitting the same too-big payload.
-			// A text answer we cut mid-string is still an answer. Deliver what
-			// was written rather than nothing — the alternative is a user who
-			// asked a question and received silence.
-			if ctx.LastStreamCut == "content_loop" {
-				// A repetition loop is a model failure, and absorbing model
-				// failure is what this system is for. Ending the run the first
-				// time it happens hands back a half-built project: measured
-				// 2026-09-14, a run with three of five files written was
-				// terminated here with the fourth never attempted, while the
-				// corrective that names this exact failure sat unused in
-				// classifyParseFailure below. Answer the loop and keep going,
-				// bounded, before considering the partial reply an outcome.
-				// Under the unproductive-only accounting, work that landed
-				// since the last charge clears the count: the run is making
-				// progress between cuts, which is not the runaway this bound
-				// exists to stop.
-				if contentLoopCountUnproductive() && st.productiveChanges > st.productiveAtLastCharge {
-					if st.contentLoopRecoveries > 0 {
-						log.Printf("[agent] content-loop allowance reset at turn %d — %d change(s) landed since the last one",
-							turn, st.productiveChanges-st.productiveAtLastCharge)
-					}
-					st.contentLoopRecoveries = 0
-				}
-				if st.contentLoopRecoveries < contentLoopRecoveryAllowance() {
-					st.contentLoopRecoveries++
-					st.productiveAtLastCharge = st.productiveChanges
-					_, corrective := parseFailureFeedback(ctx, response, ctx.LastStreamCut)
-					log.Printf("[agent] content loop at turn %d — correcting and continuing (%d/%d)",
-						turn, st.contentLoopRecoveries, contentLoopRecoveryAllowance())
-					ctx.Stream("agent_loop_recovery", map[string]interface{}{
-						"turn": turn, "attempt": st.contentLoopRecoveries,
-						"reason": "the model began repeating itself; the stream was cut and it was told why",
-					})
-					ctx.Messages = append(ctx.Messages,
-						AgentMessage{Role: "assistant", Content: attemptEcho(response, true)},
-						AgentMessage{Role: "user", Content: corrective})
-					continue
-				}
-				if salvaged, ok := recoverTruncatedText(response); ok {
-					log.Printf("[agent] salvaged %d chars of a cut text answer at turn %d", len(salvaged), turn)
-					ctx.Stream("text", map[string]string{"content": salvaged})
-					// The salvaged text is the model's own words and already
-					// reached the client as a `text` event. Repeating it in
-					// the summary of an INCOMPLETE terminal is how half-written
-					// code came to read as the answer, so the summary describes
-					// what happened instead of restating it.
-					salvageSummary := "The reply was cut short — it had begun repeating itself, " +
-						"so what arrived above is partial. Ask again if something is missing."
-					// Salvage is a third exit, alongside done and text, and it
-					// reached the user without the honesty the other two apply.
-					// Observed on aoc_slope rep2 and smallrung_toml rep2 (run
-					// 16): the cut reply was half-written code, so the run
-					// finished by handing back code that reads like the answer
-					// while nothing was on disk.
-					if st.actionDemandedAndUnmet(ctx, userMessage) {
-						log.Printf("[agent] salvaged text at turn %d with nothing written — saying so", turn)
-						salvageSummary = nothingWrittenSummary(salvageSummary)
-					}
-					emitTerminal(ctx, st, TerminalIncomplete, "text_instead_of_work",
-						salvageSummary+liveBackgroundJobNote(ctx))
-					return nil
-				}
-			}
-			category, feedback := parseFailureFeedback(ctx, response, ctx.LastStreamCut)
-			log.Printf("[agent] parse error: %v | category=%s raw_len=%d | raw %s",
-				parseErr, category, len(response), safeTextSummary(response))
-			ctx.Stream("error", map[string]string{
-				"error":    "failed to parse model response",
-				"category": category,
-			})
-			// The attempt goes back in as the assistant turn it was, before
-			// the feedback, so the retry does not resume from the prefix that
-			// produced it (see attemptEcho).
-			ctx.Messages = append(ctx.Messages,
-				AgentMessage{Role: "assistant", Content: attemptEcho(response, ctx.LastStreamCut != "")},
-				AgentMessage{Role: "user", Content: feedback})
-			// Cap parse failures the same way we cap tool failures.
-			// Five identical parse errors in a row is a stuck loop;
-			// bailing keeps us from burning 6 more LLM round-trips.
-			loop.consecutiveErrors++
-			if loop.consecutiveErrors >= 3 {
-				log.Printf("[agent] breaking parse-error loop at turn %d (%d consecutive)", turn, loop.consecutiveErrors)
-				summary := "Stopped after 3 unparseable responses — the model's tool calls keep " +
-					"getting truncated. Try a more targeted request (e.g. 'edit just the " +
-					"@app.route(\"/product\") handler in app.py') so the response stays under the " +
-					"token cap."
-				if ctx.LastStreamCut == "old_str_unmatched" {
-					summary = "Stopped: three edit_file calls in a row ran old_str past the text in " +
-						"the file, and each was cut before it was sent. Nothing was changed by them. " +
-						"Ask again and name the line to change, or ask for replace_lines with line numbers."
-				}
-				if ctx.LastStreamCut == "content_loop" {
-					// Same misdiagnosis the classifier used to make: the token cap
-					// had nothing to do with it. The model began repeating itself
-					// and the proxy cut the stream, so "make the request smaller"
-					// is advice the user cannot act on.
-					summary = "Stopped: the model began repeating itself and its response was cut " +
-						"off mid-call, three times. This usually means it tried to reproduce a " +
-						"large block of data — the contents of an input or fixture file — " +
-						"instead of writing code that reads it. Ask again and say explicitly " +
-						"that the data file should be read at runtime, not rewritten."
-				}
-				emitTerminal(ctx, st, TerminalStopped, "unusable_model_output", summary)
-				return nil
-			}
+		response, parsed, outcome, err := loop.takeModelTurn(turn)
+		switch outcome {
+		case turnEnds:
 			continue
-		}
-
-		// A tool_call can parse cleanly and still be mis-segmented: an
-		// unescaped quote inside a file body closes the JSON string early and
-		// the file's remainder is discarded into unknown keys, so a truncated
-		// write reports success (scenario D, 2026-09-15). Catch it here, before
-		// execution, and hand the model the real cause under the same retry cap
-		// parse failures use — never write the truncated content.
-		if parsed.Type == "tool_call" {
-			if feedback, bad := swallowedContentFeedback(parsed.Name, parsed.Args); bad {
-				log.Printf("[agent] turn=%d %s: content string terminated early (unescaped quote) — refusing the truncated write", turn, parsed.Name)
-				ctx.Stream("error", map[string]string{
-					"error":    "tool call content was truncated by an unescaped quote",
-					"category": "swallowed_content",
-				})
-				ctx.Messages = append(ctx.Messages, AgentMessage{Role: "user", Content: feedback})
-				loop.consecutiveErrors++
-				if loop.consecutiveErrors >= 3 {
-					log.Printf("[agent] breaking swallowed-content loop at turn %d (%d consecutive)", turn, loop.consecutiveErrors)
-					emitTerminal(ctx, st, TerminalStopped, "unusable_model_output",
-						"Stopped: the model's file writes kept ending early on an unescaped double-quote inside the content, three times in a row. Ask again and, for a large HTML/JS file, request that it be built with structural_edit or split across smaller writes."+liveBackgroundJobNote(ctx))
-					return nil
-				}
-				continue
-			}
-			// Content whose intended bytes are ambiguous (prose around a fence,
-			// a doubled escape, a line break that lost its backslash) is
-			// refused, not rewritten into a guess. Same retry cap.
-			if feedback, bad := jsonChannelContentFeedback(parsed.Name, parsed.Args); bad {
-				log.Printf("[agent] turn=%d %s: content bytes ambiguous — refused before execution", turn, parsed.Name)
-				ctx.Stream("error", map[string]string{
-					"error":    "tool call content was refused before execution: its intended bytes were ambiguous",
-					"category": "ambiguous_content",
-				})
-				ctx.Messages = append(ctx.Messages, AgentMessage{Role: "user", Content: feedback})
-				loop.consecutiveErrors++
-				if loop.consecutiveErrors >= 3 {
-					log.Printf("[agent] breaking ambiguous-content loop at turn %d (%d consecutive)", turn, loop.consecutiveErrors)
-					emitTerminal(ctx, st, TerminalStopped, "unusable_model_output",
-						"Stopped: nothing was written for the last three file writes — each one's content was ambiguous (a markdown fence with text around it, or a doubled or lost escape) and was refused rather than guessed at. Ask again."+liveBackgroundJobNote(ctx))
-					return nil
-				}
-				continue
-			}
-		}
-
-		// Log the args truncated — enables diagnosing failures like
-		// "all 3 tool calls returned Success=false" without having to add
-		// breakpoints.
-		logEvent("info",
-			fmt.Sprintf("[agent] turn=%d type=%s name=%s args=%s",
-				turn, parsed.Type, parsed.Name, safeArgsSummary(parsed.Name, parsed.Args)),
-			requestIDFromContext(ctx.Ctx), nil)
-
-		// When a tool_call still has no args after liftMissingArgs,
-		// log the raw model output so we can see exactly what shape was
-		// emitted — helps catch new alt-shapes the lift logic missed.
-		if parsed.Type == "tool_call" && (len(parsed.Args) == 0 || string(parsed.Args) == "null") {
-			// The shape is the diagnosis; the text is model output. A size and
-			// a stable hash correlate two occurrences without reproducing one.
-			log.Printf("[agent] turn=%d EMPTY ARGS — model output %s", turn, safeTextSummary(response))
+		case runEnds:
+			return err
 		}
 
 		switch parsed.Type {
@@ -4593,6 +4278,411 @@ func injectSymbolContext(ctx *AgentContext, symbols []string) {
 				})
 			}
 		}
+	}
+}
+
+// turnOutcome is what one step of a turn tells runAgentLoop to do next.
+type turnOutcome int
+
+const (
+	turnContinues turnOutcome = iota // the turn goes on to its next step
+	turnEnds                         // the turn is over: the next turn starts
+	runEnds                          // the run is over: runAgentLoop returns
+)
+
+// takeModelTurn runs the start of turn `turn`: it calls the model, then parses
+// and checks the reply. The outcome says whether the turn goes on with the
+// parsed reply, ends here, or ends the run; when the run ends, the error is
+// what runAgentLoop returns.
+func (loop *agentLoop) takeModelTurn(turn int) (string, ModelResponse, turnOutcome, error) {
+	ctx, st := loop.ctx, loop.st
+	loop.startTurn(turn)
+
+	// Bail out fast if the upstream request was cancelled (the client closed the
+	// connection, user hit Ctrl-C, terminal exited). Without this check the
+	// loop would keep grinding LLM calls and tool work for a client that's
+	// already gone, burning GPU.
+	if ctx.Ctx != nil {
+		select {
+		case <-ctx.Ctx.Done():
+			return "", ModelResponse{}, runEnds, finishCancelledRun(ctx, st, turn)
+		default:
+		}
+	}
+
+	llmStart := announceModelCall(ctx, turn)
+
+	// Call LLM with grammar constraint
+	response, tokens, err := callLLMConstrained(ctx)
+	llmElapsed := time.Since(llmStart)
+	if err != nil {
+		return "", ModelResponse{}, runEnds, loop.endOnInferenceFailure(turn, err, llmElapsed)
+	}
+	loop.recordModelReply(turn, response, tokens, llmElapsed)
+
+	// Parse the response — extract JSON even if model added surrounding text
+	parsed, parseErr := extractModelResponse(response)
+	if parseErr != nil {
+		return response, parsed, loop.recoverFromParseFailure(turn, response, parseErr), nil
+	}
+	if outcome := loop.refuseBrokenContent(turn, parsed); outcome != turnContinues {
+		return response, parsed, outcome, nil
+	}
+	logModelTurn(ctx, turn, parsed, response)
+	return response, parsed, turnContinues, nil
+}
+
+// startTurn opens turn `turn` on the run state and, once the run nears its
+// turn cap, tells the model so, once.
+func (loop *agentLoop) startTurn(turn int) {
+	ctx, st := loop.ctx, loop.st
+	st.turn = turn
+	// Budget hint — only relevant when there IS a turn cap.
+	// May 10 2026: T1/T2/T3 default to uncapped (ctx.MaxTurns == 0),
+	// so the hint is mostly dormant unless an operator explicitly
+	// sets ATLAS_MAX_TURNS. T0 still hits a hint at turn 4 if a
+	// conversational request unexpectedly tries to loop.
+	if !loop.budgetHintFired && ctx.MaxTurns > 0 && turn > 0 && turn*5 >= ctx.MaxTurns*4 {
+		loop.budgetHintFired = true
+		ctx.Messages = append(ctx.Messages, AgentMessage{
+			Role: "system",
+			Content: fmt.Sprintf(
+				"Turn budget notice: you're at turn %d of %d. If significant work remains, prioritize finishing the highest-impact items and verifying them — do not start new exploration. If you can finish in the remaining turns, keep going. If you cannot, summarize what's done and what's not in your `done` summary so the user knows what to follow up on.",
+				turn, ctx.MaxTurns),
+		})
+	}
+}
+
+// announceModelCall trims the conversation to its token budget and announces
+// the coming model call on the stream. It returns the time the call starts.
+func announceModelCall(ctx *AgentContext, turn int) time.Time {
+	// Trim conversation history if it gets too long (prevent context overflow).
+	// Keep system + most-recent-user-instruction + last 8 messages.
+	//
+	// Pinning the most recent user message is critical: long agent loops
+	// (5+ tool calls) push the user's task beyond the trim window, and
+	// the next LLM call sees only system + tool exchanges. Model has no
+	// instruction to work from and goes generic ("Hi! I'm ATLAS...").
+	// Hardcoding ctx.Messages[1] as the user msg used to work, but
+	// PriorHistory makes that index a prior-turn message instead — so
+	// scan backwards for the actual current-turn user role.
+	// Trim by TOKEN BUDGET, not a blind message count. The
+	// old `> 12 messages → keep 8` rule dropped a just-read file after
+	// a couple of turns even when the prompt was a fraction of the
+	// context window — the model would then re-read in a loop, saying
+	// "I don't see the output in the history". keepLast is now derived
+	// from how many recent messages actually fit the per-slot budget,
+	// floored at 8 so we never trim more aggressively than before.
+	trimmed := false
+	if keep := budgetedKeepLast(ctx.Messages); keep < len(ctx.Messages)-1 {
+		ctx.Messages = trimMessages(ctx.Messages, keep)
+		trimmed = true
+		log.Printf("[agent] trimmed conversation to %d messages (token-budget)", len(ctx.Messages))
+	}
+
+	// Per-turn streaming visibility: announce the start of the turn,
+	// then the LLM call boundaries. Without these the TUI sees a 10-30s
+	// gap between tool_result and the next tool_call while the model
+	// is generating — looks like a hang.
+	ctx.Stream("turn_start", map[string]interface{}{
+		"turn":     turn,
+		"messages": len(ctx.Messages),
+		"trimmed":  trimmed,
+	})
+	// Estimate prompt tokens up front (chars/4 — works for English
+	// + code, off by maybe 10–20%) so the TUI can pre-fill its
+	// context-utilization gauge while llama-server is still doing
+	// prompt eval. Authoritative count arrives in llm_call_end.
+	promptTokenEst := 0
+	for _, mm := range ctx.Messages {
+		promptTokenEst += len(mm.Content) / 4
+	}
+	ctx.Stream("llm_call_start", map[string]interface{}{
+		"turn":          turn,
+		"messages":      len(ctx.Messages),
+		"prompt_tokens": promptTokenEst,
+	})
+	Emit(NewEnvelope(EvtStageStart, "llm",
+		map[string]interface{}{"turn": turn, "messages": len(ctx.Messages)}))
+	llmStart := time.Now()
+	return llmStart
+}
+
+// endOnInferenceFailure reports a model call that failed and ends the run. It
+// returns what runAgentLoop returns: the cancelled run's own result when the
+// work context ended, and the call's error otherwise.
+func (loop *agentLoop) endOnInferenceFailure(turn int, err error, llmElapsed time.Duration) error {
+	ctx, st := loop.ctx, loop.st
+	ctx.Stream("llm_call_end", map[string]interface{}{
+		"turn":         turn,
+		"tokens":       0,
+		"total_tokens": ctx.TotalTokens,
+		"ms":           llmElapsed.Milliseconds(),
+		"error":        err.Error(),
+	})
+	Emit(Envelope{
+		EventID:    NewEventID(),
+		Timestamp:  float64(time.Now().UnixNano()) / 1e9,
+		Type:       EvtStageEnd,
+		Stage:      "llm",
+		DurationMS: llmElapsed.Milliseconds(),
+		Payload: map[string]interface{}{
+			"success": false, "error": err.Error(),
+		},
+	})
+	Emit(NewEnvelope(EvtError, "llm",
+		map[string]interface{}{"message": err.Error()}))
+	ctx.Stream("error", map[string]string{"error": err.Error()})
+	// A call that failed BECAUSE the work context ended is not an
+	// inference failure: the deadline is ours, and reporting the
+	// symptom would hide the cause and skip finalisation.
+	if ctx.Ctx != nil && ctx.Ctx.Err() != nil {
+		return finishCancelledRun(ctx, st, turn)
+	}
+	// An `error` event is not an outcome. This exit streamed one and
+	// returned, so the client saw a tool call, an error, and then
+	// nothing — aoc_sonar died here in BOTH reps on a context-size
+	// 400 and the user got silence. Every other exit in this loop
+	// authors a `done`; this one has to as well, or the failure is
+	// invisible to anything rendering the stream.
+	emitTerminal(ctx, st, TerminalFailed, "inference_failed",
+		inferenceFailureSummary(err, st.madeProductiveChange)+liveBackgroundJobNote(ctx))
+	return fmt.Errorf("LLM call failed on turn %d: %w", turn, err)
+}
+
+// recordModelReply counts the reply's tokens, keeps the reply on the run state
+// and reports the finished model call on the stream.
+func (loop *agentLoop) recordModelReply(turn int, response string, tokens int, llmElapsed time.Duration) {
+	ctx, st := loop.ctx, loop.st
+	ctx.TotalTokens += tokens
+	st.response = response
+	ctx.Stream("llm_call_end", map[string]interface{}{
+		"turn":         turn,
+		"tokens":       tokens,
+		"total_tokens": ctx.TotalTokens,
+		"ms":           llmElapsed.Milliseconds(),
+		"chars":        len(response),
+	})
+	Emit(Envelope{
+		EventID:    NewEventID(),
+		Timestamp:  float64(time.Now().UnixNano()) / 1e9,
+		Type:       EvtStageEnd,
+		Stage:      "llm",
+		DurationMS: llmElapsed.Milliseconds(),
+		Payload: map[string]interface{}{
+			"success":      true,
+			"tokens":       tokens,
+			"total_tokens": ctx.TotalTokens,
+		},
+	})
+	Emit(NewEnvelope(EvtMetric, "llm", map[string]interface{}{
+		"name": "total_tokens", "value": ctx.TotalTokens,
+	}))
+}
+
+// recoverFromParseFailure answers a reply that did not parse. A content loop is
+// corrected while its allowance lasts and a cut text answer is delivered; any
+// other failure goes back to the model with feedback until three in a row end
+// the run.
+func (loop *agentLoop) recoverFromParseFailure(turn int, response string, parseErr error) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	// Classify the failure shape once: a category for the log so
+	// docker logs reads "what kind of broken" at a glance, and
+	// targeted feedback for the model — generic "your response
+	// wasn't JSON" led to the May 2026 user-session bug where the
+	// model retried the same 1100-char edit_file with a giant
+	// old_str 5 times in a row. The response was being truncated
+	// at the llama-server token cap; the model couldn't see that
+	// and kept emitting the same too-big payload.
+	// A text answer we cut mid-string is still an answer. Deliver what
+	// was written rather than nothing — the alternative is a user who
+	// asked a question and received silence.
+	if ctx.LastStreamCut == "content_loop" {
+		// A repetition loop is a model failure, and absorbing model
+		// failure is what this system is for. Ending the run the first
+		// time it happens hands back a half-built project: measured
+		// 2026-09-14, a run with three of five files written was
+		// terminated here with the fourth never attempted, while the
+		// corrective that names this exact failure sat unused in
+		// classifyParseFailure below. Answer the loop and keep going,
+		// bounded, before considering the partial reply an outcome.
+		// Under the unproductive-only accounting, work that landed
+		// since the last charge clears the count: the run is making
+		// progress between cuts, which is not the runaway this bound
+		// exists to stop.
+		if outcome := loop.answerContentLoop(turn, response); outcome != turnContinues {
+			return outcome
+		}
+	}
+	category, feedback := parseFailureFeedback(ctx, response, ctx.LastStreamCut)
+	log.Printf("[agent] parse error: %v | category=%s raw_len=%d | raw %s",
+		parseErr, category, len(response), safeTextSummary(response))
+	ctx.Stream("error", map[string]string{
+		"error":    "failed to parse model response",
+		"category": category,
+	})
+	// The attempt goes back in as the assistant turn it was, before
+	// the feedback, so the retry does not resume from the prefix that
+	// produced it (see attemptEcho).
+	ctx.Messages = append(ctx.Messages,
+		AgentMessage{Role: "assistant", Content: attemptEcho(response, ctx.LastStreamCut != "")},
+		AgentMessage{Role: "user", Content: feedback})
+	// Cap parse failures the same way we cap tool failures.
+	// Five identical parse errors in a row is a stuck loop;
+	// bailing keeps us from burning 6 more LLM round-trips.
+	loop.consecutiveErrors++
+	if loop.consecutiveErrors >= 3 {
+		log.Printf("[agent] breaking parse-error loop at turn %d (%d consecutive)", turn, loop.consecutiveErrors)
+		summary := "Stopped after 3 unparseable responses — the model's tool calls keep " +
+			"getting truncated. Try a more targeted request (e.g. 'edit just the " +
+			"@app.route(\"/product\") handler in app.py') so the response stays under the " +
+			"token cap."
+		if ctx.LastStreamCut == "old_str_unmatched" {
+			summary = "Stopped: three edit_file calls in a row ran old_str past the text in " +
+				"the file, and each was cut before it was sent. Nothing was changed by them. " +
+				"Ask again and name the line to change, or ask for replace_lines with line numbers."
+		}
+		if ctx.LastStreamCut == "content_loop" {
+			// Same misdiagnosis the classifier used to make: the token cap
+			// had nothing to do with it. The model began repeating itself
+			// and the proxy cut the stream, so "make the request smaller"
+			// is advice the user cannot act on.
+			summary = "Stopped: the model began repeating itself and its response was cut " +
+				"off mid-call, three times. This usually means it tried to reproduce a " +
+				"large block of data — the contents of an input or fixture file — " +
+				"instead of writing code that reads it. Ask again and say explicitly " +
+				"that the data file should be read at runtime, not rewritten."
+		}
+		emitTerminal(ctx, st, TerminalStopped, "unusable_model_output", summary)
+		return runEnds
+	}
+	return turnEnds
+}
+
+// answerContentLoop answers a reply the stream cut because the model began
+// repeating itself. While the allowance lasts the model is corrected and the
+// turn ends; after that a cut text answer is delivered and the run ends. It
+// goes on when neither applies.
+func (loop *agentLoop) answerContentLoop(turn int, response string) turnOutcome {
+	ctx, st, userMessage := loop.ctx, loop.st, loop.userMessage
+	if contentLoopCountUnproductive() && st.productiveChanges > st.productiveAtLastCharge {
+		if st.contentLoopRecoveries > 0 {
+			log.Printf("[agent] content-loop allowance reset at turn %d — %d change(s) landed since the last one",
+				turn, st.productiveChanges-st.productiveAtLastCharge)
+		}
+		st.contentLoopRecoveries = 0
+	}
+	if st.contentLoopRecoveries < contentLoopRecoveryAllowance() {
+		st.contentLoopRecoveries++
+		st.productiveAtLastCharge = st.productiveChanges
+		_, corrective := parseFailureFeedback(ctx, response, ctx.LastStreamCut)
+		log.Printf("[agent] content loop at turn %d — correcting and continuing (%d/%d)",
+			turn, st.contentLoopRecoveries, contentLoopRecoveryAllowance())
+		ctx.Stream("agent_loop_recovery", map[string]interface{}{
+			"turn": turn, "attempt": st.contentLoopRecoveries,
+			"reason": "the model began repeating itself; the stream was cut and it was told why",
+		})
+		ctx.Messages = append(ctx.Messages,
+			AgentMessage{Role: "assistant", Content: attemptEcho(response, true)},
+			AgentMessage{Role: "user", Content: corrective})
+		return turnEnds
+	}
+	if salvaged, ok := recoverTruncatedText(response); ok {
+		log.Printf("[agent] salvaged %d chars of a cut text answer at turn %d", len(salvaged), turn)
+		ctx.Stream("text", map[string]string{"content": salvaged})
+		// The salvaged text is the model's own words and already
+		// reached the client as a `text` event. Repeating it in
+		// the summary of an INCOMPLETE terminal is how half-written
+		// code came to read as the answer, so the summary describes
+		// what happened instead of restating it.
+		salvageSummary := "The reply was cut short — it had begun repeating itself, " +
+			"so what arrived above is partial. Ask again if something is missing."
+		// Salvage is a third exit, alongside done and text, and it
+		// reached the user without the honesty the other two apply.
+		// Observed on aoc_slope rep2 and smallrung_toml rep2 (run
+		// 16): the cut reply was half-written code, so the run
+		// finished by handing back code that reads like the answer
+		// while nothing was on disk.
+		if st.actionDemandedAndUnmet(ctx, userMessage) {
+			log.Printf("[agent] salvaged text at turn %d with nothing written — saying so", turn)
+			salvageSummary = nothingWrittenSummary(salvageSummary)
+		}
+		emitTerminal(ctx, st, TerminalIncomplete, "text_instead_of_work",
+			salvageSummary+liveBackgroundJobNote(ctx))
+		return runEnds
+	}
+	return turnContinues
+}
+
+// refuseBrokenContent refuses, before anything runs, a tool call whose content
+// string ended early or whose intended bytes are ambiguous. Three refusals in a
+// row end the run.
+func (loop *agentLoop) refuseBrokenContent(turn int, parsed ModelResponse) turnOutcome {
+	ctx, st := loop.ctx, loop.st
+	// A tool_call can parse cleanly and still be mis-segmented: an
+	// unescaped quote inside a file body closes the JSON string early and
+	// the file's remainder is discarded into unknown keys, so a truncated
+	// write reports success (scenario D, 2026-09-15). Catch it here, before
+	// execution, and hand the model the real cause under the same retry cap
+	// parse failures use — never write the truncated content.
+	if parsed.Type == "tool_call" {
+		if feedback, bad := swallowedContentFeedback(parsed.Name, parsed.Args); bad {
+			log.Printf("[agent] turn=%d %s: content string terminated early (unescaped quote) — refusing the truncated write", turn, parsed.Name)
+			ctx.Stream("error", map[string]string{
+				"error":    "tool call content was truncated by an unescaped quote",
+				"category": "swallowed_content",
+			})
+			ctx.Messages = append(ctx.Messages, AgentMessage{Role: "user", Content: feedback})
+			loop.consecutiveErrors++
+			if loop.consecutiveErrors >= 3 {
+				log.Printf("[agent] breaking swallowed-content loop at turn %d (%d consecutive)", turn, loop.consecutiveErrors)
+				emitTerminal(ctx, st, TerminalStopped, "unusable_model_output",
+					"Stopped: the model's file writes kept ending early on an unescaped double-quote inside the content, three times in a row. Ask again and, for a large HTML/JS file, request that it be built with structural_edit or split across smaller writes."+liveBackgroundJobNote(ctx))
+				return runEnds
+			}
+			return turnEnds
+		}
+		// Content whose intended bytes are ambiguous (prose around a fence,
+		// a doubled escape, a line break that lost its backslash) is
+		// refused, not rewritten into a guess. Same retry cap.
+		if feedback, bad := jsonChannelContentFeedback(parsed.Name, parsed.Args); bad {
+			log.Printf("[agent] turn=%d %s: content bytes ambiguous — refused before execution", turn, parsed.Name)
+			ctx.Stream("error", map[string]string{
+				"error":    "tool call content was refused before execution: its intended bytes were ambiguous",
+				"category": "ambiguous_content",
+			})
+			ctx.Messages = append(ctx.Messages, AgentMessage{Role: "user", Content: feedback})
+			loop.consecutiveErrors++
+			if loop.consecutiveErrors >= 3 {
+				log.Printf("[agent] breaking ambiguous-content loop at turn %d (%d consecutive)", turn, loop.consecutiveErrors)
+				emitTerminal(ctx, st, TerminalStopped, "unusable_model_output",
+					"Stopped: nothing was written for the last three file writes — each one's content was ambiguous (a markdown fence with text around it, or a doubled or lost escape) and was refused rather than guessed at. Ask again."+liveBackgroundJobNote(ctx))
+				return runEnds
+			}
+			return turnEnds
+		}
+	}
+	return turnContinues
+}
+
+// logModelTurn writes the turn's reply to the operator log, its arguments
+// summarised, and the raw reply's shape when a tool call came without any.
+func logModelTurn(ctx *AgentContext, turn int, parsed ModelResponse, response string) {
+	// Log the args truncated — enables diagnosing failures like
+	// "all 3 tool calls returned Success=false" without having to add
+	// breakpoints.
+	logEvent("info",
+		fmt.Sprintf("[agent] turn=%d type=%s name=%s args=%s",
+			turn, parsed.Type, parsed.Name, safeArgsSummary(parsed.Name, parsed.Args)),
+		requestIDFromContext(ctx.Ctx), nil)
+
+	// When a tool_call still has no args after liftMissingArgs,
+	// log the raw model output so we can see exactly what shape was
+	// emitted — helps catch new alt-shapes the lift logic missed.
+	if parsed.Type == "tool_call" && (len(parsed.Args) == 0 || string(parsed.Args) == "null") {
+		// The shape is the diagnosis; the text is model output. A size and
+		// a stable hash correlate two occurrences without reproducing one.
+		log.Printf("[agent] turn=%d EMPTY ARGS — model output %s", turn, safeTextSummary(response))
 	}
 }
 
