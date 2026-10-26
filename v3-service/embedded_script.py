@@ -12,6 +12,12 @@ from grammars import _HTML_LANG, _JS_LANG, _PY_LANG
 with contextlib.suppress(ImportError):
     from grammars import _ts
 
+# The names that symbols.py imports from this module.
+__all__ = [
+    "_EMBEDDED_HTML_EXTS", "_EMBEDDED_MAX_BYTES", "_EMBEDDED_MAX_FINDINGS", "_css_error", "_js_error",
+    "_js_function_names", "_js_redeclaration", "_line_at", "_stopped_loop_findings", "embedded_script_blocks_for",
+]
+
 
 # --- embedded_script_check (finding F1) ---------------------------------------
 #

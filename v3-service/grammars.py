@@ -2,6 +2,12 @@
 how a friendly selector (function:NAME, class:NAME, <tag>) becomes a
 tree-sitter query in each grammar's node types."""
 
+# The names that symbols.py and embedded_script.py import from this module.
+__all__ = [
+    "_EMBEDDED_SCRIPT_AVAILABLE", "_HTML_LANG", "_JS_LANG", "_PY_LANG", "_STRUCTURAL_EDIT_AVAILABLE",
+    "_ast_language_for_path", "_ast_selector_to_query", "_supported_structural_exts", "_ts",
+]
+
 try:
     import tree_sitter as _ts
     import tree_sitter_python as _tsp

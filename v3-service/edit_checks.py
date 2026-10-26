@@ -163,7 +163,6 @@ def _syntax_error_lead(e: SyntaxError, source_text: str, selector: str, content:
     # silently suppressed the large-node message below it. Caught in
     # CI on 3.12; the host's 3.9 says "EOL while scanning" and never
     # tripped it.
-    node_lines = source_text[target.start_byte:target.end_byte].count("\n") + 1
     # The inverse case, and the more confusing one: a SMALL node with a
     # huge replacement. The model wants to change markup or JS that
     # lives in a module-level string constant, cannot select into a
