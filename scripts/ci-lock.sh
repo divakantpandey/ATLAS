@@ -23,3 +23,11 @@ uv tool run --no-build --python 3.12 --from 'pip-tools==7.6.1' --with 'click==8.
 # index, so it reads two indexes.
 uv pip compile --quiet --python-version 3.12 --python-platform x86_64-unknown-linux-gnu --generate-hashes \
     --emit-index-url --index-strategy unsafe-best-match --output-file=lens.txt lens.in
+
+# Lock v3-service (Python 3.13) and geometric-lens (Python 3.11) Dockerfile requirements
+uv pip compile --quiet --python-version 3.13 --python-platform x86_64-unknown-linux-gnu --generate-hashes \
+    --output-file=../../v3-service/requirements-lock.txt ../../v3-service/requirements.txt
+uv pip compile --quiet --python-version 3.11 --python-platform x86_64-unknown-linux-gnu --generate-hashes \
+    --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple \
+    --index-strategy unsafe-best-match --output-file=../../geometric-lens/requirements-lock.txt ../../geometric-lens/requirements.txt
+
