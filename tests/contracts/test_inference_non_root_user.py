@@ -12,6 +12,7 @@ INFERENCE_DOCKERFILES = [
     "inference/Dockerfile",
     "inference/Dockerfile.v31",
     "inference/Dockerfile.vulkan",
+    "inference/Dockerfile.rocm",
 ]
 
 
