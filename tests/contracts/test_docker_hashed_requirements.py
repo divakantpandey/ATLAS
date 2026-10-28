@@ -35,12 +35,16 @@ def test_dockerfile_installs_with_require_hashes_and_only_binary(dockerfile, req
     assert "--hash=sha256:" in lock_content, f"{lockfile} has no sha256 hashes"
 
 
+def _normalize_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def _parse_locked_versions(lock_text: str) -> dict[str, str]:
     locked = {}
     for block in re.split(r"\n(?=[a-z0-9])", lock_text):
         m = re.match(r"([a-z0-9._-]+)(?:\[[^\]]*\])?==(\S+)", block.strip())
         if m:
-            locked[m.group(1).lower()] = m.group(2)
+            locked[_normalize_name(m.group(1))] = m.group(2)
     return locked
 
 
@@ -57,7 +61,7 @@ def _parse_requirements_pins(req_text: str) -> dict[str, str]:
                 continue
         m = re.match(r"([A-Za-z0-9._-]+)==(\S+)", line)
         if m:
-            pinned[m.group(1).lower()] = m.group(2)
+            pinned[_normalize_name(m.group(1))] = m.group(2)
     return pinned
 
 
