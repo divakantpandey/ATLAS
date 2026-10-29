@@ -384,3 +384,85 @@ def test_the_executor_result_names_a_command_that_took_too_much_memory(monkeypat
     assert killed["returncode"] != OWN_LIMIT, REACHED_OWN_LIMIT
     assert killed["outcome"] == rc.OUTCOME_MEMORY_EXHAUSTED
     assert killed["success"] is False
+
+
+# --- the process supervision self-check ---------------------------------------
+
+
+def test_self_check_detects_unreadable_proc(tmp_path):
+    """When the process directory cannot be listed, the self-check reports unenforced limits."""
+    unreadable = tmp_path / "proc"
+    unreadable.mkdir()
+    os.chmod(unreadable, 0)
+    try:
+        ok, reason = rc.check_process_supervision(proc_dir=str(unreadable))
+        assert ok is False
+        assert reason == rc.SUPERVISION_UNAVAILABLE_REASON
+    finally:
+        os.chmod(unreadable, 0o755)
+
+
+def test_self_check_detects_permission_denied_on_proc(monkeypatch):
+    """Simulated permission error on /proc triggers the unreadable detection."""
+    orig_listdir = os.listdir
+
+    def mock_listdir(path="."):
+        if str(path).startswith("/proc"):
+            raise PermissionError(13, "Permission denied")
+        return orig_listdir(path)
+
+    monkeypatch.setattr(os, "listdir", mock_listdir)
+    ok, reason = rc.check_process_supervision()
+    assert ok is False
+    assert reason == rc.SUPERVISION_UNAVAILABLE_REASON
+
+
+def test_health_reports_degraded_state_when_supervision_unavailable(monkeypatch):
+    """The /health endpoint and execution results report when resource limits are not enforced."""
+    monkeypatch.syspath_prepend(SANDBOX)
+    import executor_server as ex
+
+    monkeypatch.setattr(ex, "SUPERVISION_AVAILABLE", False)
+    monkeypatch.setattr(ex, "SUPERVISION_REASON", rc.SUPERVISION_UNAVAILABLE_REASON)
+
+    health = ex.health_check()
+    assert health["status"] == "healthy"
+    assert health["limits_enforced"] is False
+    assert health["resource_limits"] == "resource limits not enforced"
+    assert health["resource_limits_reason"] == rc.SUPERVISION_UNAVAILABLE_REASON
+
+    res = ex._run_cmd(["bash", "-c", "echo ok"], timeout=5)
+    assert res["limits_enforced"] is False
+    assert res["resource_limits"] == "resource limits not enforced"
+
+
+def test_health_reports_enforced_state_when_supervision_available(monkeypatch):
+    """The /health endpoint and execution results report when resource limits are enforced."""
+    monkeypatch.syspath_prepend(SANDBOX)
+    import executor_server as ex
+
+    monkeypatch.setattr(ex, "SUPERVISION_AVAILABLE", True)
+    monkeypatch.setattr(ex, "SUPERVISION_REASON", "enforced")
+
+    health = ex.health_check()
+    assert health["status"] == "healthy"
+    assert health["limits_enforced"] is True
+    assert health["resource_limits"] == "enforced"
+    assert "resource_limits_reason" not in health
+
+    res = ex._run_cmd(["bash", "-c", "echo ok"], timeout=5)
+    assert res["limits_enforced"] is True
+    assert res["resource_limits"] == "enforced"
+
+
+def test_strict_mode_refuses_to_start_when_supervision_fails(monkeypatch):
+    """When ATLAS_STRICT_RESOURCE_LIMITS=1, failing self-check raises RuntimeError."""
+    monkeypatch.setenv("ATLAS_STRICT_RESOURCE_LIMITS", "1")
+    monkeypatch.setattr(rc, "check_process_supervision",
+                        lambda **kw: (False, rc.SUPERVISION_UNAVAILABLE_REASON))
+
+    # Verify that the startup condition raises RuntimeError
+    with pytest.raises(RuntimeError, match="Refusing to start"):
+        ok, reason = rc.check_process_supervision()
+        if not ok and os.getenv("ATLAS_STRICT_RESOURCE_LIMITS") == "1":
+            raise RuntimeError(f"Refusing to start: {reason}")
