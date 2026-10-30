@@ -1062,6 +1062,13 @@ migrate_legacy_ghcr_owner() {
     rm -f .env.owner-tmp
 }
 
+# A group's number on this host, or its name when the host has no such group.
+# A name given to Docker resolves in the image, not on the host.
+host_gid() {
+    local name="$1"
+    getent group "$name" | cut -d: -f3 | grep . || echo "$name"
+}
+
 # Set (or append) key=value in ./.env.
 set_env_file_value() {
     local key="$1" value="$2"
@@ -1126,27 +1133,29 @@ persist_backend_selection() {
     #   none + /dev/dri  -> vulkan (docker-compose.vulkan.yml)
     #   none, no /dev/dri -> cpu   (vulkan + cpu overlays, lavapipe)
     # An explicit ATLAS_BACKEND already present in .env is respected.
-    local existing
-    existing=$(env_file_value ATLAS_BACKEND)
-    if [[ -n "$existing" ]]; then
-        log_ok "Backend already set in .env: ATLAS_BACKEND=$existing"
-        return
-    fi
-
     local backend
-    case "$GPU_VENDOR" in
-        amd)    backend="rocm" ;;
-        nvidia) backend="cuda" ;;
-        *)
-            if [[ -e /dev/dri ]]; then
-                backend="vulkan"
-            else
-                backend="cpu"
-            fi
-            ;;
-    esac
-    set_env_file_value ATLAS_BACKEND "$backend"
-    log_ok "Recorded ATLAS_BACKEND=$backend so later lifecycle commands pick the matching compose overlays"
+    backend=$(env_file_value ATLAS_BACKEND)
+    if [[ -n "$backend" ]]; then
+        log_ok "Backend already set in .env: ATLAS_BACKEND=$backend"
+    else
+        case "$GPU_VENDOR" in
+            amd)    backend="rocm" ;;
+            nvidia) backend="cuda" ;;
+            *)
+                if [[ -e /dev/dri ]]; then
+                    backend="vulkan"
+                else
+                    backend="cpu"
+                fi
+                ;;
+        esac
+        set_env_file_value ATLAS_BACKEND "$backend"
+        log_ok "Recorded ATLAS_BACKEND=$backend so later lifecycle commands pick the matching compose overlays"
+    fi
+    if [[ "$backend" == "rocm" || "$backend" == "vulkan" ]]; then
+        set_env_file_value ATLAS_VIDEO_GID "$(host_gid video)"
+        set_env_file_value ATLAS_RENDER_GID "$(host_gid render)"
+    fi
 }
 
 install_atlas_cli() {
@@ -1596,7 +1605,7 @@ build_asa_steering_vector() {
         amd)
             image="ghcr.io/${ghcr_owner}/atlas-llama-rocm:${image_tag}"
             gpu_run_args=(--device=/dev/kfd --device=/dev/dri
-                          --group-add video --group-add render)
+                          --group-add "$(host_gid video)" --group-add "$(host_gid render)")
             ;;
         *)
             log_skip "ASA build requires a GPU — skipping (build later with \`atlas asa build\`)"
@@ -1673,11 +1682,14 @@ build_asa_steering_vector() {
     $DC stop llama-server >> "$ATLAS_RUN_DIR/atlas-asa-build.log" 2>&1 || true
 
     # 3. Run cvector-generator as a one-shot container with a rw models
-    #    mount (the compose mount is :ro on purpose).
+    #    mount (the compose mount is :ro on purpose), as the user who owns
+    #    that folder. The image's HOME belongs to its own account.
     log_info "Running llama-cvector-generator — this is the slow part (~5 min)…"
     echo
     set +e
     $DOCKER_PREFIX docker run --rm "${gpu_run_args[@]}" \
+        --user "$(id -u "$TARGET_USER"):$(id -g "$TARGET_USER")" \
+        --env HOME=/tmp \
         -v "$models_dir:/models:rw" \
         --entrypoint llama-cvector-generator \
         "$image" \
@@ -1702,10 +1714,6 @@ build_asa_steering_vector() {
     if [[ $rc -eq 0 ]] && [[ -s "$vector_build_path" ]]; then
         mv -f "$vector_build_path" "$vector_path"
         printf '%s\n' "${ATLAS_MODEL_NAME:-${model_file%.gguf}}" > "$vector_path.model"
-        # Fix ownership (cvector-generator runs as root inside the container).
-        if [[ "$(id -u)" == "0" && "$TARGET_USER" != "root" ]]; then
-            $SUDO chown "$TARGET_USER:$TARGET_USER" "$vector_path" 2>/dev/null || true
-        fi
         log_ok "ASA steering vector built ($(du -h "$vector_path" | cut -f1)): $vector_path"
         log_info "  Auto-activates on the next llama-server start via the entrypoint check."
         # Bounce llama-server one more time so it picks up the new vector.
