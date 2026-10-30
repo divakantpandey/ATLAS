@@ -196,8 +196,6 @@ WORKSPACE_BASE = Path(os.getenv("WORKSPACE_BASE", "/tmp/sandbox"))
 SUPERVISION_AVAILABLE, SUPERVISION_REASON = check_process_supervision()
 if not SUPERVISION_AVAILABLE:
     logger.warning("Resource limits: %s", SUPERVISION_REASON)
-    if os.getenv("ATLAS_STRICT_RESOURCE_LIMITS") == "1":
-        raise RuntimeError(f"Refusing to start: {SUPERVISION_REASON}")
 
 SUPPORTED_LANGUAGES = {
     "python", "py", "python3",

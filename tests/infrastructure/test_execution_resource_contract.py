@@ -389,17 +389,18 @@ def test_the_executor_result_names_a_command_that_took_too_much_memory(monkeypat
 # --- the process supervision self-check ---------------------------------------
 
 
+@needs_proc
+def test_self_check_passes_with_real_proc():
+    """On a host with a working /proc, the self-check finds its probe child and reports enforced."""
+    assert rc.check_process_supervision() == (True, "enforced")
+
+
 def test_self_check_detects_unreadable_proc(tmp_path):
     """When the process directory cannot be listed, the self-check reports unenforced limits."""
     unreadable = tmp_path / "proc"
-    unreadable.mkdir()
-    os.chmod(unreadable, 0)
-    try:
-        ok, reason = rc.check_process_supervision(proc_dir=str(unreadable))
-        assert ok is False
-        assert reason == rc.SUPERVISION_UNAVAILABLE_REASON
-    finally:
-        os.chmod(unreadable, 0o755)
+    ok, reason = rc.check_process_supervision(proc_dir=str(unreadable))
+    assert ok is False
+    assert reason == rc.SUPERVISION_UNAVAILABLE_REASON
 
 
 def test_self_check_detects_permission_denied_on_proc(monkeypatch):
@@ -453,16 +454,3 @@ def test_health_reports_enforced_state_when_supervision_available(monkeypatch):
     res = ex._run_cmd(["bash", "-c", "echo ok"], timeout=5)
     assert res["limits_enforced"] is True
     assert res["resource_limits"] == "enforced"
-
-
-def test_strict_mode_refuses_to_start_when_supervision_fails(monkeypatch):
-    """When ATLAS_STRICT_RESOURCE_LIMITS=1, failing self-check raises RuntimeError."""
-    monkeypatch.setenv("ATLAS_STRICT_RESOURCE_LIMITS", "1")
-    monkeypatch.setattr(rc, "check_process_supervision",
-                        lambda **kw: (False, rc.SUPERVISION_UNAVAILABLE_REASON))
-
-    # Verify that the startup condition raises RuntimeError
-    with pytest.raises(RuntimeError, match="Refusing to start"):
-        ok, reason = rc.check_process_supervision()
-        if not ok and os.getenv("ATLAS_STRICT_RESOURCE_LIMITS") == "1":
-            raise RuntimeError(f"Refusing to start: {reason}")

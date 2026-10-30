@@ -426,7 +426,7 @@ def check_process_supervision(proc_dir: str = "/proc") -> tuple[bool, str]:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=run_env,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
         pgid = proc.pid
         deadline = time.monotonic() + 0.5
