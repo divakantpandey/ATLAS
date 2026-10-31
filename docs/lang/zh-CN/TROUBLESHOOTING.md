@@ -27,8 +27,8 @@ docker compose logs --tail 50
 | NVIDIA CUDA | `nvidia-smi` |
 | AMD ROCm | 运行 `rocm-smi` 并确认 `/dev/kfd` 存在。 |
 | Apple Silicon / Metal | 运行 `atlas doctor`；如果原生服务器未监听，请按照 [SETUP_MACOS.md](../../SETUP_MACOS.md#troubleshooting) 中的说明启动 `./scripts/atlas-llama-macos.sh`，并检查其前台启动器输出。 |
-| Vulkan | 确认 `/dev/dri` 存在，然后运行 `docker compose -f docker-compose.yml -f docker-compose.vulkan.yml exec llama-server vulkaninfo --summary`。 |
-| 纯 CPU | 确认 `docker-compose.vulkan.yml` 和 `docker-compose.cpu.yml` 覆盖层已启用。`atlas doctor` 不应仅因没有 GPU 而失败，而应发出警告并成功退出。 |
+| Vulkan | 确认 `/dev/dri` 存在，然后运行 `docker compose -f docker-compose.yml -f compose/docker-compose.vulkan.yml exec llama-server vulkaninfo --summary`。 |
+| 纯 CPU | 确认 `compose/docker-compose.vulkan.yml` 和 `compose/docker-compose.cpu.yml` 覆盖层已启用。`atlas doctor` 不应仅因没有 GPU 而失败，而应发出警告并成功退出。 |
 
 逐服务的健康检查 curl 命令见 [SETUP.md § 验证安装](SETUP.md#验证安装)。atlas-proxy 的健康检查端点对分诊最有用 —— 它会报告所有上游服务的状态：
 ```json
@@ -268,10 +268,10 @@ atlas doctor
 
 ```bash
 echo "ATLAS_HSA_OVERRIDE_GFX_VERSION=10.3.0" >> .env
-docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d --force-recreate llama-server
+docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml up -d --force-recreate llama-server
 ```
 
-如果这个方法在一张此前不受支持的卡上对你有效，请在 [GH #26](https://github.com/inferstep/ATLAS/issues/26) 留言 —— 社区验证过的覆盖值会进入下一个版本的文档。
+如果这个方法在一张此前不受支持的卡上对你有效，请在 [Hardware reports](https://github.com/inferstep/ATLAS/discussions/categories/hardware-reports) 留言 —— 社区验证过的覆盖值会进入下一个版本的文档。
 
 ### RDNA4（RX 9070 / 9070 XT，gfx1200 / gfx1201）—— 需要 ROCm 7.x
 
@@ -290,15 +290,15 @@ ATLAS_GFX_TARGET=gfx1201   # gfx1200 for RX 9070, gfx1201 for RX 9070 XT
 然后重新构建并拉起整个栈：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.rocm.yml build llama-server
-docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
+docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml build llama-server
+docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml up -d
 ```
 
 **重要：不要为 gfx1200/gfx1201 设置 `ATLAS_HSA_OVERRIDE_GFX_VERSION`。** ROCm 7.0+ 原生支持这些目标；在 Docker 内覆盖 GFX 版本会导致编译出的内核与运行时目标不匹配，从而崩溃。保持 `ATLAS_HSA_OVERRIDE_GFX_VERSION` 未设置（默认）。
 
 ### ROCm 容器无法拉取 `rocm/rocm-terminal`
 
-**现象：** `atlas doctor` 的 ROCm 检查在镜像拉取处超时，或 `docker compose -f ... -f docker-compose.rocm.yml pull` 在 `llama-server` 构建上失败。
+**现象：** `atlas doctor` 的 ROCm 检查在镜像拉取处超时，或 `docker compose -f ... -f compose/docker-compose.rocm.yml pull` 在 `llama-server` 构建上失败。
 
 **含义：** ROCm 镜像很大（约 2 GB），且 Docker Hub 对匿名拉取限流。
 
@@ -312,7 +312,7 @@ docker pull rocm/rocm-terminal:latest
 doctor 的 ROCm 检查始终使用 `rocm/rocm-terminal:latest`。`ATLAS_ROCM_TAG` 固定的是 llama-server ROCm 构建的*构建基础*镜像（`rocm/dev-ubuntu-*`），而不是 doctor 检查用的镜像：
 
 ```bash
-ATLAS_ROCM_TAG=6.2-complete docker compose -f docker-compose.yml -f docker-compose.rocm.yml build llama-server
+ATLAS_ROCM_TAG=6.2-complete docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml build llama-server
 ```
 
 ### 首次构建失败（找不到 CUDA）
@@ -489,7 +489,7 @@ docker compose logs llama-server | tail -20   # model loads, no CUDA errors
 curl -s localhost:8080/health                  # {"status":"ok"}
 ```
 
-**仍然失败：** 确认容器确实在运行你重建的镜像（`docker compose images llama-server` —— `docker compose pull` 可能已把它覆盖；固定 `ATLAS_IMAGE_TAG` 或重新构建）。Pascal（`60`/`61`）及更老的卡受上游 llama.cpp CUDA 支持所限 —— Vulkan 镜像（`docker-compose.vulkan.yml`）是回退方案。若仍不行，请附上 `nvidia-smi` 输出和 llama-server 日志的前 50 行提交 issue。
+**仍然失败：** 确认容器确实在运行你重建的镜像（`docker compose images llama-server` —— `docker compose pull` 可能已把它覆盖；固定 `ATLAS_IMAGE_TAG` 或重新构建）。Pascal（`60`/`61`）及更老的卡受上游 llama.cpp CUDA 支持所限 —— Vulkan 镜像（`compose/docker-compose.vulkan.yml`）是回退方案。若仍不行，请附上 `nvidia-smi` 输出和 llama-server 日志的前 50 行提交 issue。
 
 ### 模型在 CPU 而非 GPU 上加载
 
@@ -578,6 +578,7 @@ nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -I{} kill {}
 **解决方法：** 代理在 `/v1/agent` 的 agent 循环处理器内部自动设置 `response_format`。`ATLAS_GRAMMAR_MODE` 决定其形态：默认的 `strict` 发送 `{"type":"json_object","schema":<full tool-call schema>}`，让 llama-server 的 GBNF 采样器只能发出 tool_call/text/done 联合形态之一；`ATLAS_GRAMMAR_MODE=loose` 只发送 `{"type":"json_object"}`（有效 JSON，不强制形态）—— 这是为 schema 转 GBNF 处理得不好的模型准备的逃生口（Gemma 家族模型需要 `loose` —— strict 模式会让它们疯狂输出 done）。如果你直接通过 `/v1/chat/completions` 或 `/v1/completions` 调用 llama-server，需要自己带上该参数：
 ```bash
 curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $(cat secrets/service-token)" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "local-model",
@@ -697,7 +698,7 @@ ATLAS_FRESH_SLOT_PER_SESSION=0
 
 **怎么做：** 通过 `read_file` 读取缺失的文件，让它进入项目上下文。如果你直接调用 sandbox 的 `/execute` API，在请求体中传入辅助文件：
 ```bash
-curl -X POST http://localhost:30820/execute -d '{
+curl -X POST http://localhost:30820/execute -H "Authorization: Bearer $(cat secrets/service-token)" -d '{
   "code": "from utils import greet\nprint(greet(\"x\"))",
   "language": "python",
   "files": {"utils.py": "def greet(n): return f\"hi {n}\""}
@@ -811,7 +812,7 @@ curl -s http://localhost:8099/health | python3 -m json.tool | grep -A2 fingerpri
 **解决：**
 1. 确认嵌入服务器的约定。池化 + 归一化的服务器会返回 ‖v‖≈1 的扁平向量：
    ```bash
-   curl -s -X POST http://localhost:8080/embedding -H 'Content-Type: application/json' \
+   curl -s -X POST http://localhost:8080/embedding -H "Authorization: Bearer $(cat secrets/service-token)" -H 'Content-Type: application/json' \
      -d '{"content":"def add(a, b): return a + b","embd_normalize":-1}' | python3 -c "import sys,json,math; e=json.load(sys.stdin)[0]['embedding']; import itertools; v=e if not isinstance(e[0],list) else [sum(c)/len(e) for c in zip(*e)]; print('shape', 'per_token' if isinstance(e[0],list) else 'flat', 'norm', round(math.sqrt(sum(x*x for x in v)),3))"
    ```
    池化后的 `norm` 应在数百量级（随附的 Gemma 工件约为 100-150）。若 `norm` 恰好为 `1.0`，说明服务器无视了 `embd_normalize: -1` 而对向量做了归一化，此时 C(x) 对任何输入都会返回约 0.8 的恒定值：分数看似正常，却无法区分任何东西。
@@ -828,6 +829,7 @@ curl -s http://localhost:8099/health | python3 -m json.tool | grep -A2 fingerpri
 ```bash
 # Test the native embedding endpoint directly
 curl -s http://localhost:8080/embedding \
+  -H "Authorization: Bearer $(cat secrets/service-token)" \
   -H "Content-Type: application/json" \
   -d '{"content": "test"}' | python3 -m json.tool
 ```

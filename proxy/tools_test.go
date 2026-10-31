@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2302,11 +2304,7 @@ func TestEditToolsReportTheDecisiveStructuralRefusal(t *testing.T) {
 // producer, and the remaining legacy wrapper calls are named rather than
 // counted, so a reintroduction has to edit this list.
 func TestLegacyCheckerWrapperInventory(t *testing.T) {
-	src, err := os.ReadFile("tools.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := string(src)
+	body := toolSources(t)
 
 	span := func(from, to string) string {
 		i := strings.Index(body, from)
@@ -2323,7 +2321,7 @@ func TestLegacyCheckerWrapperInventory(t *testing.T) {
 	for name, fn := range map[string]string{
 		"edit_file":     span("Name:   \"edit_file\"", "\nfunc structuralEditTool("),
 		"insert_after":  span("Name:   \"insert_after\"", "\n// replaceLinesMaxSpan"),
-		"replace_lines": span("Name:   \"replace_lines\"", "\nfunc deleteFileTool("),
+		"replace_lines": span("Name:   \"replace_lines\"", "\nfunc runCommandTool("),
 	} {
 		if n := strings.Count(fn, "checkFallbackSyntax("); n != 0 {
 			t.Errorf("%s still calls the legacy wrapper %d time(s)", name, n)
@@ -2792,4 +2790,206 @@ func TestOnlyAllToolsRangesTheRegistry(t *testing.T) {
 	if found != 1 {
 		t.Errorf("%d ranges over toolRegistry, want exactly the one in %s()", found, authority)
 	}
+}
+
+func TestOutlineFileListsSymbolsAndTheirCallEdges(t *testing.T) {
+	v3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"supported":true,"symbols":[
+			{"name":"mean","kind":"function","start_line":1,"end_line":2,"calls":["total"],"called_by":["report"]}]}`))
+	}))
+	defer v3.Close()
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "stats.py"), []byte("def mean(v):\n    return total(v)\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("no code here\n"), 0o644)
+	ctx := NewAgentContext(dir, Tier2Medium)
+	ctx.V3URL = v3.URL
+
+	var out OutlineOutput
+	res := executeToolCall("outline_file", json.RawMessage(`{"path":"stats.py"}`), ctx)
+	if err := json.Unmarshal(res.Data, &out); err != nil {
+		t.Fatalf("%v: %s", err, res.Error)
+	}
+	want := "stats.py — 3 lines, 1 symbols (tree-sitter)\n" +
+		"L1-2\tfunction mean\n\tcalls: total\n\tcalled by: report\n"
+	if !strings.HasPrefix(out.Outline, want) {
+		t.Errorf("outline = %q, want it to start %q", out.Outline, want)
+	}
+	if !strings.Contains(out.Outline, "follow the call edges") {
+		t.Errorf("edges were shown with no note on using them: %q", out.Outline)
+	}
+
+	res = executeToolCall("outline_file", json.RawMessage(`{"path":"notes.txt"}`), ctx)
+	if err := json.Unmarshal(res.Data, &out); err != nil {
+		t.Fatalf("%v: %s", err, res.Error)
+	}
+	want = "notes.txt — 2 lines, 0 symbols (scan)\n(no top-level functions/classes found — read_file to view it directly)\n"
+	if out.Outline != want {
+		t.Errorf("outline = %q, want %q", out.Outline, want)
+	}
+}
+
+func TestMoveFileIntoANewFolderNamedWithASlash(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "app.py"), []byte("A = 1\n"), 0o644)
+	ctx := NewAgentContext(dir, Tier2Medium)
+
+	res := executeToolCall("move_file", json.RawMessage(`{"source":"app.py","destination":"src/"}`), ctx)
+
+	if !res.Success {
+		t.Fatalf("the move failed: %s", res.Error)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "src", "app.py")); err != nil {
+		t.Errorf("the file did not land inside the new folder: %v", err)
+	}
+}
+
+func TestFindFileLeavesOutToolFoldersAndCapsItsAnswer(t *testing.T) {
+	dir := t.TempDir()
+	// .git sorts before the other files, so a walk that entered it would show.
+	os.Mkdir(filepath.Join(dir, ".git"), 0o755)
+	os.WriteFile(filepath.Join(dir, ".git", "app.py"), nil, 0o644)
+	for i := 0; i <= maxFindFileMatches; i++ {
+		os.WriteFile(filepath.Join(dir, fmt.Sprintf("app%d.py", i)), nil, 0o644)
+	}
+	ctx := NewAgentContext(dir, Tier2Medium)
+
+	var out FindFileOutput
+	res := executeToolCall("find_file", json.RawMessage(`{"pattern":"^app.*py$"}`), ctx)
+	if err := json.Unmarshal(res.Data, &out); err != nil {
+		t.Fatalf("%v: %s", err, res.Error)
+	}
+	if out.TotalCount != maxFindFileMatches {
+		t.Errorf("TotalCount = %d, want %d", out.TotalCount, maxFindFileMatches)
+	}
+	if !out.Truncated {
+		t.Error("an answer stopped at the cap must say it is truncated")
+	}
+	for _, m := range out.Matches {
+		if strings.HasPrefix(m.Path, ".git") {
+			t.Fatalf("the walk entered .git: %s", m.Path)
+		}
+	}
+
+	res = executeToolCall("find_file", json.RawMessage(`{"pattern":"app","path":"missing"}`), ctx)
+	if !res.Success {
+		t.Errorf("a folder that cannot be walked is an empty answer, got: %s", res.Error)
+	}
+}
+
+func TestSettleWindowDefaultsAndStaysInBounds(t *testing.T) {
+	asked := func(ms int) *int { return &ms }
+	cases := []struct {
+		name string
+		in   *int
+		want time.Duration
+	}{
+		{"not asked", nil, 1500 * time.Millisecond},
+		{"asked", asked(250), 250 * time.Millisecond},
+		{"below zero", asked(-1), 0},
+		{"above the limit", asked(20000), 10 * time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := settleWindow(c.in); got != c.want {
+				t.Errorf("settleWindow = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestReadFileByteCapTakesTheOverrideAndTheUpperClamp(t *testing.T) {
+	cases := []struct {
+		name, override string
+		want           int
+	}{
+		{"an override wins, unclamped", "300000", 300000},
+		{"a bad override is ignored", "many", 200_000},
+		{"a huge context stops at the clamp", "", 200_000},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("ATLAS_MAX_READ_BYTES", c.override)
+			t.Setenv("ATLAS_CTX_SIZE", "4000000")
+			t.Setenv("ATLAS_PARALLEL_SLOTS", "1")
+			if got := readFileByteCap(); got != c.want {
+				t.Errorf("readFileByteCap = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestRunBackgroundRefusesBeforeItStarts(t *testing.T) {
+	const refused = "find . -name '*.tmp' -delete"
+	cases := []struct {
+		name    string
+		trust   trustMode
+		command string
+		want    string
+	}{
+		{"untrusted", trustUntrusted, "python app.py", untrustedRefusal},
+		{"a command the shell check refuses", trustFullyTrusted, refused, validateShellCommand(refused)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := NewAgentContext(t.TempDir(), Tier2Medium)
+			ctx.TrustMode = c.trust
+			args, _ := json.Marshal(RunBackgroundInput{Command: c.command})
+
+			res, err := getTool("run_background").Execute(args, ctx)
+
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Success {
+				t.Error("the call was not refused")
+			}
+			if res.Error != c.want {
+				t.Errorf("Error = %q, want %q", res.Error, c.want)
+			}
+		})
+	}
+}
+
+// toolFiles are the files that hold the tools. A guard over the tools reads
+// them all, so code that moves between them stays under the guard.
+var toolFiles = []string{"tools.go", "tool_read.go", "tool_background.go", "tool_schema.go", "tool_files.go"}
+
+func toolSources(t *testing.T) string {
+	t.Helper()
+	var all strings.Builder
+	for _, file := range toolFiles {
+		all.WriteString(readSourceForTest(t, file))
+	}
+	return all.String()
+}
+
+// syntaxCallCounts counts the calls of the structured syntax checker and of
+// the legacy wrapper across toolFiles.
+func syntaxCallCounts(t *testing.T) (structured, legacy int) {
+	t.Helper()
+	fset := token.NewFileSet()
+	for _, file := range toolFiles {
+		f, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			id, ok := call.Fun.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			switch id.Name {
+			case "fallbackSyntaxOutcomeFor":
+				structured++
+			case "checkFallbackSyntax":
+				legacy++
+			}
+			return true
+		})
+	}
+	return structured, legacy
 }

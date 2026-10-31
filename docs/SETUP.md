@@ -8,7 +8,7 @@ Four deployment methods: **one-shot bootstrap** (recommended for new installs), 
 
 The install steps depend on your hardware + OS. Find the row that matches your setup, then jump to the linked section.
 
-| Your hardware | OS | Recommended path | Support level ([matrix](../SUPPORT_MATRIX.md)) |
+| Your hardware | OS | Recommended path | Support level ([matrix](SUPPORT_MATRIX.md)) |
 |---|---|---|---|
 | NVIDIA RTX 50-series / Blackwell (GB10) | Linux | [Method 0: bootstrap](#method-0-one-shot-bootstrap) or [Method 1: Docker](#method-1-docker-compose-recommended) | Supported — published CUDA image targets Blackwell |
 | NVIDIA RTX 20/30/40, GTX 10xx, datacenter (V100/A100/H100/T4/L4) | Linux | [Method 1: Docker](#method-1-docker-compose-recommended) + one-time [local rebuild](#cuda-compute-capability-dockerfilev31) | Preview — local rebuild required |
@@ -57,7 +57,7 @@ Or, from a checkout:
 ./scripts/atlas-bootstrap.sh
 ```
 
-**Distributions the bootstrap accepts** (CI tests Ubuntu 22.04/24.04, Debian 12 and Rocky 9 — see the [support matrix](../SUPPORT_MATRIX.md)):
+**Distributions the bootstrap accepts** (CI tests Ubuntu 22.04/24.04, Debian 12 and Rocky 9 — see the [support matrix](SUPPORT_MATRIX.md)):
 
 | Family | Distros |
 |---|---|
@@ -79,13 +79,15 @@ set `ATLAS_BOOTSTRAP_SKIP_DOCKER=1` before running the bootstrap.
 **Model selection:** `.env.example` ships with no model selected. When the bootstrap creates `.env` and `ATLAS_MODEL_FILE` is empty, it writes the registry's default recommended model into `.env` (logged as it happens) so the one-shot flow completes without a wizard. Change the selection any time by editing `.env` or running `atlas init`. An existing non-empty selection is respected.
 
 <a id="cpu-only"></a>
+**Internal auth:** the bootstrap writes `secrets/service-token`, readable by the installing user only, and records that user's ids in `.env` as `ATLAS_PROXY_UID`, `ATLAS_PROXY_GID`, `ATLAS_SANDBOX_UID` and `ATLAS_SANDBOX_GID`, unless they are already set. A re-run keeps an existing token. On an older install it adds one, takes over a `secrets/` that Docker made as root, and recreates the services so they read it. Direct calls to a service then need the header `Authorization: Bearer <token>`; a call without it gets 401. `atlas` and the TUI send it for the installing user. Another user on the box cannot read the token, so their calls are refused.
+
 **CPU-only / no-GPU hosts (Preview — smoke-test only).** ATLAS boots without a
 GPU via the Vulkan image's lavapipe CPU rasterizer, but inference is very
 slow; use this to verify the stack works, not for real coding sessions.
 
 1. **The bootstrap refuses no-GPU hosts unless you opt in:**
    `ATLAS_BOOTSTRAP_SKIP_GPU=1 ./scripts/atlas-bootstrap.sh`
-   It layers `docker-compose.vulkan.yml` (+ `docker-compose.cpu.yml` when
+   It layers `compose/docker-compose.vulkan.yml` (+ `compose/docker-compose.cpu.yml` when
    `/dev/dri` is absent), writes the model selection and
    `ATLAS_BACKEND=vulkan|cpu` into `.env` itself, and skips the ASA build.
 2. **Do not run `atlas init` on a GPU-less host** — the wizard intentionally
@@ -97,9 +99,12 @@ Manual equivalent:
 ```bash
 cp .env.example .env    # set ATLAS_MODEL_FILE / ATLAS_MODEL_NAME
 atlas model install Qwen3.5-9B-Q6_K
-docker compose -f docker-compose.yml -f docker-compose.vulkan.yml -f docker-compose.cpu.yml up -d
+docker compose -f docker-compose.yml -f compose/docker-compose.vulkan.yml -f compose/docker-compose.cpu.yml up -d
 atlas doctor            # gpu check WARNS ("CPU-only mode — very slow"); warns exit 0
 ```
+
+A `.env` made by hand gets no service token, so internal auth stays off there.
+The bootstrap and `atlas init` write one.
 
 **Firewall:** the Compose stack publishes every service on `127.0.0.1` only, so local use needs no firewall change and the bootstrap leaves firewalld alone by default. Set `ATLAS_BOOTSTRAP_OPEN_FIREWALL=1` to open the service ports (8090, 8099, 8070, 30820) for deployments that rebind services to a routable interface.
 
@@ -153,7 +158,7 @@ bash atlas-bootstrap.sh
 
 **Downloads and logs.** The installer keeps its downloads and logs in a private temporary folder that it makes for the run. An install that passed removes the folder at the end. When the install failed, or a step warned and named its log, the folder is kept, and the last line of the output gives its path.
 
-**Why `/opt/atlas`?** It's the standard FHS prefix for system-wide third-party software, survives `$HOME` cleanup, and lets multiple users on the same box share one install. If you'd rather it land in your home dir:
+**Why `/opt/atlas`?** It's the standard FHS prefix for system-wide third-party software, and it survives `$HOME` cleanup. One user owns the install: the service token is theirs alone. If you'd rather it land in your home dir:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/inferstep/ATLAS/main/scripts/atlas-bootstrap.sh \
@@ -264,7 +269,7 @@ ${EDITOR:-vi} .env
 #    NVIDIA hosts (default):
 docker compose up -d                                                  # or: podman-compose up -d
 #    AMD ROCm hosts:
-docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
+docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml up -d
 #    `atlas init` writes a marker comment into .env telling you which to use.
 
 # 7. Verify everything is healthy (wait for all services to show "healthy")
@@ -281,13 +286,13 @@ The ROCm path is identical to NVIDIA *except* for these four points:
 
 1. **Bring up with both compose files** (`atlas init` writes this command into `.env` and prints it):
    ```bash
-   docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
+   docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml up -d
    ```
    The override switches the llama-server image to the ROCm build, swaps the NVIDIA driver request for `/dev/kfd` + `/dev/dri` passthrough, and forces `ATLAS_BACKEND=rocm` so the entrypoint takes the HIP-tuning branch.
 
-2. **The llama-server image is built on your machine, not pulled.** GHCR carries prebuilt CUDA and Vulkan llama images; there is no published `atlas-llama-rocm`, because CI has no AMD GPU to test one on (ROCm is Community-tested — see [SUPPORT_MATRIX.md](../SUPPORT_MATRIX.md)). The override declares `pull_policy: build`, so `docker compose pull` skips llama-server and the `up` above compiles it from `inference/Dockerfile.rocm`; later builds reuse the layer cache. Every other ATLAS service still pulls its prebuilt image as usual. To build it ahead of time:
+2. **The llama-server image is built on your machine, not pulled.** GHCR carries prebuilt CUDA and Vulkan llama images; there is no published `atlas-llama-rocm`, because CI has no AMD GPU to test one on (ROCm is Community-tested — see [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md)). The override declares `pull_policy: build`, so `docker compose pull` skips llama-server and the `up` above compiles it from `inference/Dockerfile.rocm`; later builds reuse the layer cache. Every other ATLAS service still pulls its prebuilt image as usual. To build it ahead of time:
    ```bash
-   docker compose -f docker-compose.yml -f docker-compose.rocm.yml build llama-server
+   docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml build llama-server
    ```
 
 3. **No `nvidia-container-toolkit`** — ROCm doesn't need a separate container runtime, just kernel-level device access. Confirm your user is in the right groups:
@@ -301,7 +306,7 @@ The ROCm path is identical to NVIDIA *except* for these four points:
 4. **GPU compute target.** The default `Dockerfile.rocm` build is a "fat" image covering RDNA3 (7000 series), RDNA2 (6000 series), and CDNA2 (MI200) — `gfx1100;gfx1101;gfx1102;gfx1030;gfx90a`. For a smaller image targeted at your specific GPU, set `ATLAS_GFX_TARGET` before building:
    ```bash
    # Example: only build for RX 7900 XT/XTX
-   ATLAS_GFX_TARGET=gfx1100 docker compose -f docker-compose.yml -f docker-compose.rocm.yml build llama-server
+   ATLAS_GFX_TARGET=gfx1100 docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml build llama-server
    ```
    See [LLVM AMDGPU processor table](https://llvm.org/docs/AMDGPUUsage.html) for the gfx target of your card.
 
@@ -318,10 +323,10 @@ Use it when CUDA/ROCm isn't an option, or to smoke-test whether ATLAS boots on u
 # (the wizard offers Vulkan when your GPU vendor's native backend isn't packaged,
 #  or run with --backend vulkan to force it regardless of vendor):
 atlas init --backend vulkan
-docker compose -f docker-compose.yml -f docker-compose.vulkan.yml up -d
+docker compose -f docker-compose.yml -f compose/docker-compose.vulkan.yml up -d
 
 # Option B — already-installed deployment, just switch the override file:
-docker compose -f docker-compose.yml -f docker-compose.vulkan.yml up -d
+docker compose -f docker-compose.yml -f compose/docker-compose.vulkan.yml up -d
 # (the entrypoint dispatches on ATLAS_BACKEND, which the compose overlay
 #  sets to vulkan; .env's value is ignored when the overlay is in play)
 ```
@@ -804,7 +809,7 @@ Any GPU with 8 GB+ VRAM and a llama.cpp-supported backend:
 | NVIDIA (Blackwell — RTX 50xx, GB10) | CUDA | Supported (published image) | `inference/Dockerfile.v31` | RTX 5060 Ti 16GB (primary dev) |
 | NVIDIA (pre-Blackwell — RTX 20xx–40xx, GTX 10xx, V100/A100/H100/T4/L4) | CUDA | Preview — one-time [local rebuild required](#cuda-compute-capability-dockerfilev31) | `inference/Dockerfile.v31` + `--build-arg CUDA_ARCH=<cc>` | — (upstream llama.cpp supports these; no maintainer validation on ATLAS) |
 | AMD | ROCm / HIP | Community-tested | `inference/Dockerfile.rocm` | RX 7900 XTX (community smoke-test, [GH #26](https://github.com/inferstep/ATLAS/issues/26)) |
-| Apple Silicon | Metal | Supported (macOS hybrid: native llama-server + Docker, [#32](https://github.com/inferstep/ATLAS/issues/32)) | `scripts/atlas-setup-macos.sh` + `docker-compose.macos.yml` | M2 Pro 32GB (verified); M3/M4 (target) |
+| Apple Silicon | Metal | Supported (macOS hybrid: native llama-server + Docker, [#32](https://github.com/inferstep/ATLAS/issues/32)) | `scripts/atlas-setup-macos.sh` + `compose/docker-compose.macos.yml` | M2 Pro 32GB (verified); M3/M4 (target) |
 | Any (cross-vendor fallback) | Vulkan | Preview | `inference/Dockerfile.vulkan` | lavapipe (CPU ICD) smoke-tested; no real-GPU validation yet |
 | Intel Arc | SYCL | Roadmap — Intel Arc uses Vulkan today | TBD | Arc A770 16GB (target) |
 
@@ -852,7 +857,7 @@ Override at build time with `--build-arg GFX_TARGET=<value>` (or via `ATLAS_GFX_
 
 ```bash
 # Single target — RX 7900 XT/XTX only (smaller image)
-ATLAS_GFX_TARGET=gfx1100 docker compose -f docker-compose.yml -f docker-compose.rocm.yml build llama-server
+ATLAS_GFX_TARGET=gfx1100 docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml build llama-server
 
 # Two targets for RDNA3 + RDNA2 mixed-fleet
 docker build --build-arg GFX_TARGET="gfx1100;gfx1030" -f inference/Dockerfile.rocm -t atlas-llama-rocm:custom inference/
@@ -884,7 +889,7 @@ Your GPU's gfx target: `rocminfo | grep -i gfx | head -1` (or look it up in the 
 
 ATLAS needs the Geometric Lens for every request ([ADR 0011](adr/0011-the-lens-is-required.md)). The lens needs C(x) and G(x) weights for the served model. Without them, the proxy refuses each request with HTTP 503 `dependency_unavailable` and says why, and `atlas doctor` fails. A lens that has weights but no calibration yet is accepted: it scores, and its threshold interventions wait for calibration.
 
-Models listed with lens artifacts in [SUPPORT_MATRIX.md](../SUPPORT_MATRIX.md) get them from `atlas model install-artifacts`. Pre-trained weights and training data are also available on HuggingFace:
+Models listed with lens artifacts in [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md) get them from `atlas model install-artifacts`. Pre-trained weights and training data are also available on HuggingFace:
 
 **[ATLAS Dataset on HuggingFace](https://huggingface.co/datasets/itigges22/ATLAS)** — includes embeddings, training data, and weight files.
 

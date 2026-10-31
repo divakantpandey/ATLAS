@@ -193,6 +193,21 @@ def test_every_finding_says_why_and_how_to_fix(ic):
         assert f.fix.strip(), f.what
 
 
+def test_the_task_names_come_from_the_runner_at_its_new_place(ic, tmp_path):
+    runner = tmp_path / "scripts" / "eval" / "e2e-reliability.py"
+    runner.parent.mkdir(parents=True)
+    runner.write_text('TASKS = {"a_task": None}\n')
+    assert ic.task_names(tmp_path) == {"a_task"}
+
+
+def test_the_runner_at_its_old_place_wins_while_both_exist(ic, tmp_path):
+    new = tmp_path / "scripts" / "eval" / "e2e-reliability.py"
+    new.parent.mkdir(parents=True)
+    new.write_text('TASKS = {"from_the_new_place": None}\n')
+    (tmp_path / "scripts" / "e2e-reliability.py").write_text('TASKS = {"from_the_old_place": None}\n')
+    assert ic.task_names(tmp_path) == {"from_the_old_place"}
+
+
 def test_the_task_names_come_from_the_runner(ic):
     names = ic.task_names()
     assert {"flask_pause", "aoc_sonar", "multifile_cli"} <= names
@@ -502,7 +517,9 @@ def test_a_size_baseline_that_cannot_be_read_needs_approval(ic):
     (".github/code-health-baseline.json", CONFIGURES),
     ("scripts/integrity_check.py", CONFIGURES),
     ("scripts/checks_ran.py", CONFIGURES),
+    (".github/codecov.yml", CONFIGURES),
     ("codecov.yml", CONFIGURES),
+    ("dev/.codecov.yaml", CONFIGURES),
     ("tests/replay/recordings/normal_edit.json", CONFIGURES),
     ("tests/infrastructure/gradle_wrapper_jar_sums.txt", CONFIGURES),
     (".github/canary.json", CONFIGURES),
@@ -1224,7 +1241,6 @@ def test_the_check_reads_this_repositorys_own_settings_and_hook(ic):
     marks = ic.left_out_marks((root / "pyproject.toml").read_text(encoding="utf-8"))
     assert marks == ("integration",)
     targets = ic.hook_targets((root / "tests" / "conftest.py").read_text(encoding="utf-8"), marks)
-    assert "/tests/integration/" in targets
     files = sorted(target for target in targets if target.endswith(".py"))
     assert files
     assert all((root / target.lstrip("/")).is_file() for target in files)

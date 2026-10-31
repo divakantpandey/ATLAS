@@ -14,10 +14,10 @@
 #        (Apple Silicon / Intel Arc not yet supported — V3.1.2 roadmap)
 #   4. RHEL-family: enables EPEL, warns about nouveau. (Firewalld ports are
 #      opt-in via ATLAS_BOOTSTRAP_OPEN_FIREWALL=1 — services bind loopback.)
-#   5. Copies .env.example to .env if missing.
+#   5. Copies .env.example to .env if missing, and writes the service token.
 #   6. Downloads model GGUFs and Lens weights from HuggingFace.
 #   7. `docker compose up -d` and waits for all services healthy.
-#      (ROCm hosts: brings up with -f docker-compose.rocm.yml override.)
+#      (ROCm hosts: brings up with -f compose/docker-compose.rocm.yml override.)
 #   8. Prints a green "ATLAS ready" banner and the next-step command.
 #
 # Idempotent — safe to re-run. Each step checks "already done" before acting.
@@ -712,7 +712,7 @@ install_nvidia_toolkit() {
 # ROCm path is structurally simpler than NVIDIA because Docker doesn't
 # need a separate container runtime (no rocm-container-toolkit). It just
 # needs /dev/kfd + /dev/dri passed through with appropriate group
-# membership, which our docker-compose.rocm.yml handles. Host-side prereqs:
+# membership, which our compose/docker-compose.rocm.yml handles. Host-side prereqs:
 #   1. AMDGPU kernel driver loaded → /dev/kfd exists
 #   2. `render` and `video` groups exist on the host
 #   3. The user running docker is a member of those groups
@@ -762,7 +762,7 @@ install_rocm_setup() {
     done
 
     # 3. Add docker-running user to render + video so containers can
-    # read /dev/kfd and /dev/dri/* via group_add in docker-compose.rocm.yml.
+    # read /dev/kfd and /dev/dri/* via group_add in compose/docker-compose.rocm.yml.
     local target_user="$TARGET_USER"
     if [[ "$target_user" != "root" ]]; then
         local missing_groups=""
@@ -834,7 +834,7 @@ install_gpu_runtime() {
 compose_files_args() {
     case "$GPU_VENDOR" in
         amd)
-            echo "-f docker-compose.yml -f docker-compose.rocm.yml"
+            echo "-f docker-compose.yml -f compose/docker-compose.rocm.yml"
             ;;
         nvidia)
             # Empty = compose uses its default discovery, which is the
@@ -843,9 +843,9 @@ compose_files_args() {
             ;;
         *)
             if [[ -e /dev/dri ]]; then
-                echo "-f docker-compose.yml -f docker-compose.vulkan.yml"
+                echo "-f docker-compose.yml -f compose/docker-compose.vulkan.yml"
             else
-                echo "-f docker-compose.yml -f docker-compose.vulkan.yml -f docker-compose.cpu.yml"
+                echo "-f docker-compose.yml -f compose/docker-compose.vulkan.yml -f compose/docker-compose.cpu.yml"
             fi
             ;;
     esac
@@ -1015,6 +1015,7 @@ ensure_repo_and_env() {
     migrate_legacy_ghcr_owner
     ensure_default_model_selected
     persist_backend_selection
+    ensure_service_token
 
     install_atlas_cli || die "ATLAS CLI installation failed."
     install_go || die "Go installation failed; atlas-tui cannot be built."
@@ -1060,6 +1061,21 @@ migrate_legacy_ghcr_owner() {
         log_warn "Could not update ATLAS_GHCR_OWNER in .env; set it to inferstep by hand."
     fi
     rm -f .env.owner-tmp
+}
+
+# A group's number on this host, or its name when the host has no such group.
+# A name given to Docker resolves in the image, not on the host.
+host_gid() {
+    local name="$1"
+    getent group "$name" | cut -d: -f3 | grep . || echo "$name"
+}
+
+# Set key=value in ./.env unless the key already holds a value.
+keep_or_set_env_file_value() {
+    local key="$1" value="$2"
+    if [[ -z "$(env_file_value "$key")" ]]; then
+        set_env_file_value "$key" "$value"
+    fi
 }
 
 # Set (or append) key=value in ./.env.
@@ -1121,32 +1137,65 @@ persist_backend_selection() {
     # compose.py all read ATLAS_BACKEND; without it they fall back to the base
     # CUDA file and fail on GPU-less hosts with "could not select device
     # driver nvidia". Keys mirror compose_files_args + _OVERLAY_BY_BACKEND:
-    #   amd    -> rocm   (docker-compose.rocm.yml)
+    #   amd    -> rocm   (compose/docker-compose.rocm.yml)
     #   nvidia -> cuda   (base file only)
-    #   none + /dev/dri  -> vulkan (docker-compose.vulkan.yml)
+    #   none + /dev/dri  -> vulkan (compose/docker-compose.vulkan.yml)
     #   none, no /dev/dri -> cpu   (vulkan + cpu overlays, lavapipe)
     # An explicit ATLAS_BACKEND already present in .env is respected.
-    local existing
-    existing=$(env_file_value ATLAS_BACKEND)
-    if [[ -n "$existing" ]]; then
-        log_ok "Backend already set in .env: ATLAS_BACKEND=$existing"
+    local backend newly_recorded=""
+    backend=$(env_file_value ATLAS_BACKEND)
+    if [[ -n "$backend" ]]; then
+        log_ok "Backend already set in .env: ATLAS_BACKEND=$backend"
+    else
+        case "$GPU_VENDOR" in
+            amd)    backend="rocm" ;;
+            nvidia) backend="cuda" ;;
+            *)
+                if [[ -e /dev/dri ]]; then
+                    backend="vulkan"
+                else
+                    backend="cpu"
+                fi
+                ;;
+        esac
+        set_env_file_value ATLAS_BACKEND "$backend"
+        log_ok "Recorded ATLAS_BACKEND=$backend so later lifecycle commands pick the matching compose overlays"
+        newly_recorded=yes
+    fi
+    if [[ "$backend" == "rocm" || "$backend" == "vulkan" ]]; then
+        set_env_file_value ATLAS_VIDEO_GID "$(host_gid video)"
+        set_env_file_value ATLAS_RENDER_GID "$(host_gid render)"
+        # An existing install keeps its account until `atlas init --reconfigure`.
+        if [[ -n "$newly_recorded" ]]; then
+            set_env_file_value ATLAS_LLAMA_USER "$(id -u "$TARGET_USER"):$(id -g "$TARGET_USER")"
+        fi
+    fi
+}
+
+# What `atlas init` does for internal auth: the same path, modes and token form.
+# The services must run as the user who owns the token, or they cannot read it.
+ensure_service_token() {
+    keep_or_set_env_file_value ATLAS_PROXY_UID "$TARGET_UID"
+    keep_or_set_env_file_value ATLAS_PROXY_GID "$TARGET_GID"
+    keep_or_set_env_file_value ATLAS_SANDBOX_UID "$TARGET_UID"
+    keep_or_set_env_file_value ATLAS_SANDBOX_GID "$TARGET_GID"
+    if [[ "$TARGET_UID" == "0" ]]; then
+        log_warn "Installing from a root login: the services, the sandbox among them, run as root. Run as a normal user to avoid this."
+    fi
+    # A stack started before there was a token left Docker's ./secrets, owned by root.
+    if [[ -d secrets && "$(stat -c '%u' secrets)" != "$TARGET_UID" ]]; then
+        $SUDO chown -R "$TARGET_UID:$TARGET_GID" secrets \
+            || die "secrets/ belongs to another user. Fix: sudo chown -R $TARGET_UID:$TARGET_GID secrets, then run this again."
+    fi
+    if [[ -f secrets/service-token ]]; then
+        log_ok "Service token already present at secrets/service-token (kept)"
         return
     fi
-
-    local backend
-    case "$GPU_VENDOR" in
-        amd)    backend="rocm" ;;
-        nvidia) backend="cuda" ;;
-        *)
-            if [[ -e /dev/dri ]]; then
-                backend="vulkan"
-            else
-                backend="cpu"
-            fi
-            ;;
-    esac
-    set_env_file_value ATLAS_BACKEND "$backend"
-    log_ok "Recorded ATLAS_BACKEND=$backend so later lifecycle commands pick the matching compose overlays"
+    run_as_target bash -c 'umask 077 && mkdir -p secrets && chmod 700 secrets &&
+        printf "atlas-st-%s\n" "$(head -c 32 /dev/urandom | base64 | tr "+/" "-_" | tr -d "=\n")" > secrets/service-token' \
+        || die "Could not write secrets/service-token."
+    SERVICE_TOKEN_IS_NEW=1
+    log_ok "Wrote secrets/service-token (mode 0600) — internal service auth"
 }
 
 install_atlas_cli() {
@@ -1425,12 +1474,12 @@ start_compose() {
         log_warn "Using sudo for docker compose (user not in docker group yet — log out/in to fix)"
     fi
     if [[ "$GPU_VENDOR" == "amd" ]]; then
-        log_info "Using ROCm compose override (docker-compose.rocm.yml)"
+        log_info "Using ROCm compose override (compose/docker-compose.rocm.yml)"
     elif [[ -z "$GPU_VENDOR" ]]; then
         if [[ -e /dev/dri ]]; then
-            log_info "No GPU vendor detected — using Vulkan overlay (docker-compose.vulkan.yml)"
+            log_info "No GPU vendor detected — using Vulkan overlay (compose/docker-compose.vulkan.yml)"
         else
-            log_warn "No GPU and no /dev/dri — using the CPU override (docker-compose.cpu.yml, lavapipe)."
+            log_warn "No GPU and no /dev/dri — using the CPU override (compose/docker-compose.cpu.yml, lavapipe)."
             log_warn "Inference will be very slow."
         fi
     fi
@@ -1455,8 +1504,13 @@ start_compose() {
 
     log_info "Starting containers…"
     echo
+    # `up -d` keeps a running container, which would never see a new token.
+    local up_args=(-d)
+    if [[ -n "${SERVICE_TOKEN_IS_NEW:-}" ]]; then
+        up_args+=(--force-recreate)
+    fi
     set +e
-    $DC up -d 2>&1 | tee "$ATLAS_RUN_DIR/atlas-compose.log"
+    $DC up "${up_args[@]}" 2>&1 | tee "$ATLAS_RUN_DIR/atlas-compose.log"
     rc=${PIPESTATUS[0]}
     set -e
     echo
@@ -1596,7 +1650,7 @@ build_asa_steering_vector() {
         amd)
             image="ghcr.io/${ghcr_owner}/atlas-llama-rocm:${image_tag}"
             gpu_run_args=(--device=/dev/kfd --device=/dev/dri
-                          --group-add video --group-add render)
+                          --group-add "$(host_gid video)" --group-add "$(host_gid render)")
             ;;
         *)
             log_skip "ASA build requires a GPU — skipping (build later with \`atlas asa build\`)"
@@ -1673,11 +1727,14 @@ build_asa_steering_vector() {
     $DC stop llama-server >> "$ATLAS_RUN_DIR/atlas-asa-build.log" 2>&1 || true
 
     # 3. Run cvector-generator as a one-shot container with a rw models
-    #    mount (the compose mount is :ro on purpose).
+    #    mount (the compose mount is :ro on purpose), as the user who owns
+    #    that folder. The image's HOME belongs to its own account.
     log_info "Running llama-cvector-generator — this is the slow part (~5 min)…"
     echo
     set +e
     $DOCKER_PREFIX docker run --rm "${gpu_run_args[@]}" \
+        --user "$(id -u "$TARGET_USER"):$(id -g "$TARGET_USER")" \
+        --env HOME=/tmp \
         -v "$models_dir:/models:rw" \
         --entrypoint llama-cvector-generator \
         "$image" \
@@ -1702,10 +1759,6 @@ build_asa_steering_vector() {
     if [[ $rc -eq 0 ]] && [[ -s "$vector_build_path" ]]; then
         mv -f "$vector_build_path" "$vector_path"
         printf '%s\n' "${ATLAS_MODEL_NAME:-${model_file%.gguf}}" > "$vector_path.model"
-        # Fix ownership (cvector-generator runs as root inside the container).
-        if [[ "$(id -u)" == "0" && "$TARGET_USER" != "root" ]]; then
-            $SUDO chown "$TARGET_USER:$TARGET_USER" "$vector_path" 2>/dev/null || true
-        fi
         log_ok "ASA steering vector built ($(du -h "$vector_path" | cut -f1)): $vector_path"
         log_info "  Auto-activates on the next llama-server start via the entrypoint check."
         # Bounce llama-server one more time so it picks up the new vector.
@@ -1739,7 +1792,7 @@ run_doctor() {
     local install_dir="${ATLAS_INSTALL_DIR:-$(pwd)}"
     local doctor_out doctor_rc
     set +e
-    doctor_out=$(cd "$install_dir" && python3 -m atlas.commands.doctor --quick --no-color 2>&1)
+    doctor_out=$(cd "$install_dir" && python3 -m atlas doctor --quick --no-color 2>&1)
     doctor_rc=$?
     set -e
 
@@ -1816,9 +1869,9 @@ main() {
     echo
     log_info "Install location: ${BOLD}${ATLAS_INSTALL_DIR:-/opt/atlas}${NC} (override with ATLAS_INSTALL_DIR=...)"
     log_info "  Why /opt/atlas? It's the standard prefix for system-wide third-party"
-    log_info "  software (FHS), survives \$HOME purges, and lets multiple users on the"
-    log_info "  same box share one install. Set ATLAS_INSTALL_DIR=\$HOME/atlas if you'd"
-    log_info "  rather it land in your home dir."
+    log_info "  software (FHS) and survives \$HOME purges. One user owns the install:"
+    log_info "  the service token is theirs alone. Set ATLAS_INSTALL_DIR=\$HOME/atlas if"
+    log_info "  you'd rather it land in your home dir."
     echo
 
     install_docker

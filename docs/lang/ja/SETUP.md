@@ -11,7 +11,7 @@
 
 インストール手順はハードウェアと OS に依存します。お使いの構成に合う行を探して、リンク先のセクションに進んでください。
 
-| ハードウェア | OS | 推奨パス | サポートレベル ([マトリクス](../../../SUPPORT_MATRIX.md)) |
+| ハードウェア | OS | 推奨パス | サポートレベル ([マトリクス](../../SUPPORT_MATRIX.md)) |
 |---|---|---|---|
 | NVIDIA RTX 50 シリーズ / Blackwell (B100、GB10) | Linux | [方法 0: ブートストラップ](#方法-0-ワンショットブートストラップ) または [方法 1: Docker](#方法-1-docker-compose-推奨) | サポート対象 (Supported) — 公開されている CUDA イメージは Blackwell を対象 |
 | NVIDIA RTX 20/30/40、GTX 10xx、データセンター (V100/A100/H100/T4/L4) | Linux | [方法 1: Docker](#方法-1-docker-compose-推奨) + 一度だけの[ローカル再ビルド](#cuda-compute-capability-dockerfilev31) | プレビュー (Preview) — ローカル再ビルドが必要 |
@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/inferstep/ATLAS/main/scripts/atlas-
 
 1. **ブートストラップは、明示的にオプトインしない限り GPU なしのホストを拒否します:**
    `ATLAS_BOOTSTRAP_SKIP_GPU=1 ./scripts/atlas-bootstrap.sh`
-   これは `docker-compose.vulkan.yml` を重ね（`/dev/dri` がない場合はさらに `docker-compose.cpu.yml` も）、モデル選択と `ATLAS_BACKEND=vulkan|cpu` を自ら `.env` に書き込み、ASA ビルドをスキップします。
+   これは `compose/docker-compose.vulkan.yml` を重ね（`/dev/dri` がない場合はさらに `compose/docker-compose.cpu.yml` も）、モデル選択と `ATLAS_BACKEND=vulkan|cpu` を自ら `.env` に書き込み、ASA ビルドをスキップします。
 2. **GPU のないホストで `atlas init` を実行しないでください** — ウィザードは、サイズを決められない `.env` を書き込む代わりに、意図的に拒否します（exit 1）。モデル選択はブートストラップが処理します。モデルは後から `atlas model install` で変更してください。
 
 手動での同等手順:
@@ -87,7 +87,7 @@ curl -fsSL https://raw.githubusercontent.com/inferstep/ATLAS/main/scripts/atlas-
 ```bash
 cp .env.example .env    # set ATLAS_MODEL_FILE / ATLAS_MODEL_NAME
 atlas model install Qwen3.5-9B-Q6_K
-docker compose -f docker-compose.yml -f docker-compose.vulkan.yml -f docker-compose.cpu.yml up -d
+docker compose -f docker-compose.yml -f compose/docker-compose.vulkan.yml -f compose/docker-compose.cpu.yml up -d
 atlas doctor            # gpu check WARNS ("CPU-only mode — very slow"); warns exit 0
 ```
 
@@ -138,7 +138,7 @@ bash atlas-bootstrap.sh
 | `ATLAS_REPO_URL=https://...` | 別のリポジトリ URL |
 | `ATLAS_GO_VERSION=1.26.10` | TUI ビルド用にインストールされる Go ツールチェーンのバージョン（TUI には 1.26.10+ が必要。より古いインストール済みツールチェーンは自動で取得します） |
 
-**なぜ `/opt/atlas` なのか?** システム全体で使うサードパーティソフトウェアの標準的な FHS プレフィックスであり、`$HOME` のクリーンアップを生き残り、同じマシンの複数ユーザーが 1 つのインストールを共有できるためです。ホームディレクトリに置きたい場合は:
+**なぜ `/opt/atlas` なのか?** システム全体で使うサードパーティソフトウェアの標準的な FHS プレフィックスであり、`$HOME` のクリーンアップを生き残るためです。インストールを所有するユーザーは 1 人で、サービストークンはそのユーザー専用です。ホームディレクトリに置きたい場合は:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/inferstep/ATLAS/main/scripts/atlas-bootstrap.sh \
@@ -249,7 +249,7 @@ ${EDITOR:-vi} .env
 #    NVIDIA hosts (default):
 docker compose up -d                                                  # or: podman-compose up -d
 #    AMD ROCm hosts:
-docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
+docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml up -d
 #    `atlas init` writes a marker comment into .env telling you which to use.
 
 # 7. Verify everything is healthy (wait for all services to show "healthy")
@@ -266,7 +266,7 @@ ROCm パスは、次の 3 点を*除いて* NVIDIA と同一です:
 
 1. **両方の compose ファイルで立ち上げる**（または `atlas init` に任せる）:
    ```bash
-   docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
+   docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml up -d
    ```
    オーバーライドは llama-server のイメージを ROCm ビルドに切り替え、NVIDIA のドライバ要求を `/dev/kfd` + `/dev/dri` のパススルーに差し替え、エントリーポイントが HIP チューニング分岐を取るよう `ATLAS_BACKEND=rocm` を強制します。
 
@@ -281,7 +281,7 @@ ROCm パスは、次の 3 点を*除いて* NVIDIA と同一です:
 3. **GPU のコンピュートターゲット。** デフォルトの `Dockerfile.rocm` ビルドは、RDNA3（7000 シリーズ）、RDNA2（6000 シリーズ）、CDNA2（MI200）をカバーする「肥大」イメージです — `gfx1100;gfx1101;gfx1102;gfx1030;gfx90a`。特定の GPU に絞ったより小さいイメージを作るには、ビルド前に `ATLAS_GFX_TARGET` を設定してください:
    ```bash
    # Example: only build for RX 7900 XT/XTX
-   ATLAS_GFX_TARGET=gfx1100 docker compose -f docker-compose.yml -f docker-compose.rocm.yml build llama-server
+   ATLAS_GFX_TARGET=gfx1100 docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml build llama-server
    ```
    お使いのカードの gfx ターゲットは [LLVM AMDGPU プロセッサ表](https://llvm.org/docs/AMDGPUUsage.html) を参照してください。
 
@@ -298,10 +298,10 @@ CUDA/ROCm が選択肢にないとき、あるいは珍しいハードウェア�
 # (the wizard offers Vulkan when your GPU vendor's native backend isn't packaged,
 #  or run with --backend vulkan to force it regardless of vendor):
 atlas init --backend vulkan
-docker compose -f docker-compose.yml -f docker-compose.vulkan.yml up -d
+docker compose -f docker-compose.yml -f compose/docker-compose.vulkan.yml up -d
 
 # Option B — already-installed deployment, just switch the override file:
-docker compose -f docker-compose.yml -f docker-compose.vulkan.yml up -d
+docker compose -f docker-compose.yml -f compose/docker-compose.vulkan.yml up -d
 # (the entrypoint dispatches on ATLAS_BACKEND, which the compose overlay
 #  sets to vulkan; .env's value is ignored when the overlay is in play)
 ```
@@ -333,7 +333,7 @@ ATLAS は 2 つの CPU アーキテクチャを対象としています: `x86_64
 
 - **NVIDIA DGX Spark**（Grace-Blackwell GB10）— sbsa ベースイメージによる CUDA、compute cap 12.0/12.1
 - **NVIDIA Jetson Orin / AGX / Nano** — l4t ベースイメージによる CUDA、compute cap 8.7
-- **Apple Silicon (M1/M2/M3/M4)** — Docker Desktop の MoltenVK 経由の Vulkan（低速パス）。高速パスとしてのネイティブ Metal インストールは [#32](https://github.com/inferstep/ATLAS/issues/32) で追跡
+- **Apple Silicon (M1/M2/M3/M4)** — Docker Desktop の MoltenVK 経由の Vulkan（低速パス）。出荷済みの高速パスはネイティブのハイブリッド Metal インストールです。[SETUP_MACOS.md](../../SETUP_MACOS.md) を参照してください
 - **Snapdragon X Elite**（Windows on ARM ラップトップ）— Adreno ドライバ経由の Vulkan
 - **Raspberry Pi 5** — Mesa V3D ドライバ経由の Vulkan、CPU 級の性能を想定
 - **Ampere Altra / AWS Graviton ワークステーション** — lavapipe 経由の Vulkan（コンシューマ向け arm64 dGPU がまだ存在しないため CPU フォールバック）
@@ -735,7 +735,7 @@ medium ティアが ATLAS の開発ターゲットです — `atlas-bootstrap.sh
 | NVIDIA (Blackwell — RTX 50xx、B100、GB10) | CUDA | サポート対象 (Supported)（公開イメージ） | `inference/Dockerfile.v31` | RTX 5060 Ti 16GB（主要開発機） |
 | NVIDIA (Blackwell 以前 — RTX 20xx–40xx、GTX 10xx、V100/A100/H100/T4/L4) | CUDA | プレビュー (Preview) — 一度だけの[ローカル再ビルドが必要](#cuda-compute-capability-dockerfilev31) | `inference/Dockerfile.v31` + `--build-arg CUDA_ARCH=<cc>` | —（上流の llama.cpp はこれらをサポート。ATLAS 上でのメンテナー検証はなし） |
 | AMD | ROCm / HIP | コミュニティ検証済み (Community-tested) | `inference/Dockerfile.rocm` | RX 7900 XTX（コミュニティスモークテスト、[GH #26](https://github.com/inferstep/ATLAS/issues/26)） |
-| Apple Silicon | Metal | サポート対象（macOS ハイブリッド: ネイティブ llama-server + Docker、[#32](https://github.com/inferstep/ATLAS/issues/32)） | `scripts/atlas-setup-macos.sh` + `docker-compose.macos.yml` | M2 Pro 32GB（検証済み）、M3/M4（対象） |
+| Apple Silicon | Metal | サポート対象（macOS ハイブリッド: ネイティブ llama-server + Docker、[#32](https://github.com/inferstep/ATLAS/issues/32)） | `scripts/atlas-setup-macos.sh` + `compose/docker-compose.macos.yml` | M2 Pro 32GB（検証済み）、M3/M4（対象） |
 | 任意（クロスベンダーフォールバック） | Vulkan | プレビュー | `inference/Dockerfile.vulkan` | lavapipe（CPU ICD）でスモークテスト済み。実 GPU での検証はまだなし |
 | Intel Arc | SYCL | ロードマップ (Roadmap) — Intel Arc は現在 Vulkan を使用 | 未定 | Arc A770 16GB（対象） |
 
@@ -783,7 +783,7 @@ docker compose build --build-arg CUDA_ARCH="86;89;90" llama-server
 
 ```bash
 # Single target — RX 7900 XT/XTX only (smaller image)
-ATLAS_GFX_TARGET=gfx1100 docker compose -f docker-compose.yml -f docker-compose.rocm.yml build llama-server
+ATLAS_GFX_TARGET=gfx1100 docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml build llama-server
 
 # Two targets for RDNA3 + RDNA2 mixed-fleet
 docker build --build-arg GFX_TARGET="gfx1100;gfx1030" -f inference/Dockerfile.rocm -t atlas-llama-rocm:custom inference/
@@ -815,7 +815,7 @@ docker build --build-arg GFX_TARGET="gfx1100;gfx1030" -f inference/Dockerfile.ro
 
 ATLAS のすべてのリクエストは Geometric Lens を必要とします（[ADR 0011](../../adr/0011-the-lens-is-required.md)）。レンズは提供されるモデルの C(x) / G(x) ウェイトを必要とします。それらがないと、プロキシは HTTP 503 `dependency_unavailable` ですべてのリクエストを拒否し、理由を示します。`atlas doctor` も失敗します。ウェイトはあるがキャリブレーションがまだのレンズは受け入れられます。スコアは返し、しきい値の介入はキャリブレーションを待ちます。
 
-[SUPPORT_MATRIX.md](../../../SUPPORT_MATRIX.md) にレンズアーティファクトが載っているモデルは `atlas model install-artifacts` で取得できます。事前トレーニング済みウェイトとトレーニングデータは HuggingFace でも入手できます:
+[SUPPORT_MATRIX.md](../../SUPPORT_MATRIX.md) にレンズアーティファクトが載っているモデルは `atlas model install-artifacts` で取得できます。事前トレーニング済みウェイトとトレーニングデータは HuggingFace でも入手できます:
 
 **[ATLAS Dataset on HuggingFace](https://huggingface.co/datasets/itigges22/ATLAS)** — エンベディング、トレーニングデータ、ウェイトファイルが含まれています。
 

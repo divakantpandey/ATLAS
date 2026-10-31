@@ -144,7 +144,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
           cache: pip
@@ -234,7 +234,7 @@ jobs:
           # No cache: this job builds the proxy once, in about ten seconds,
           # and restoring a cache takes as long.
           cache: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.11'
       - name: Build proxy (for binary-size metric)
@@ -253,7 +253,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -376,7 +376,7 @@ jobs:
           # and restoring a cache takes as long.
           cache: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
           cache: pip
@@ -446,14 +446,14 @@ jobs:
           fi
           echo "Pinned SHA: $SHA"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          for f in inference/Dockerfile inference/Dockerfile.rocm inference/Dockerfile.vulkan; do
+          for f in inference/Dockerfile.rocm inference/Dockerfile.vulkan; do
             if ! grep -q "LLAMA_CPP_REV=$SHA" "$f"; then
               actual=$(grep -oP '(?<=ARG LLAMA_CPP_REV=)[a-f0-9]+' "$f" | head -1)
               echo "::error file=$f::LLAMA_CPP_REV mismatch — found '$actual', expected '$SHA' (matches Dockerfile.v31). Bump all 4 Dockerfiles together."
               exit 1
             fi
           done
-          echo "All 4 Dockerfiles agree on LLAMA_CPP_REV=$SHA"
+          echo "All 3 Dockerfiles agree on LLAMA_CPP_REV=$SHA"
 
       - name: fetch pinned llama.cpp
         # Mirror the production fetch pattern: init + shallow-fetch a
@@ -526,7 +526,7 @@ jobs:
       # does not read that form yet, so the form both read is kept.
       - uses: ./.github/actions/docker-hub-mirror  # zizmor: ignore[self-repository]
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
           cache: pip
@@ -641,7 +641,7 @@ jobs:
           # No cache: the two builds take less time than restoring one.
           cache: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
           cache: pip
@@ -727,7 +727,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # Codecov files a report under the head commit of a pull request
-          # and reads codecov.yml from that commit.
+          # and reads .github/codecov.yml from that commit.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 

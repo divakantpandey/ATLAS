@@ -6,7 +6,7 @@ versions are recorded for reproducible builds.
 
 ## Application accounts
 
-The four service images each create a **named non-root account inside
+The five service images each create a **named non-root account inside
 their own image** (table below); `docker-compose.yml` runs them with the
 installing user's uid:gid instead (see below).
 
@@ -16,19 +16,27 @@ installing user's uid:gid instead (see below).
 | v3-service | `appuser` | 1001:1001 | 8070 |
 | geometric-lens | `lens` | 1001:1001 | 8099 |
 | sandbox | `sandbox` | 1000:1000 (overridable via `ATLAS_SANDBOX_UID/GID`) | 8020 |
-| llama-server (`atlas-llama`, `inference/Dockerfile.v31`) | root (no `USER` directive) | 0:0 | 8080 (`EXPOSE`) |
+| llama-server (`atlas-llama`, `inference/Dockerfile*`) | `atlas`, not the image's default | 1001:1001 | 8080 (`EXPOSE`) |
 
-`docker-compose.yml` runs the proxy, the V3 service and the lens as
-`ATLAS_PROXY_UID:ATLAS_PROXY_GID`, and the sandbox as
+`docker-compose.yml` runs llama-server, the proxy, the V3 service and the lens
+as `ATLAS_PROXY_UID:ATLAS_PROXY_GID`, and the sandbox as
 `ATLAS_SANDBOX_UID:ATLAS_SANDBOX_GID`: the installing user's ids, which
-`atlas init` writes. So each of them can read the service token, which
-`atlas init` makes readable for that user only (0600).
+`atlas init` and the bootstrap write. So each of them can read the service
+token, which they make readable for that user only (0600).
 
-The inference image is the exception to the non-root pattern: it runs as
-root inside its container, isolated by the container boundary and, under
-Docker Compose, the localhost-only port publish (the K3s method publishes
-it as a NodePort on every node address) rather than an unprivileged
-account.
+llama-server stops with an error when its token folder or token is there and
+cannot be read, so it never starts with internal auth off by accident. The K3s
+template mounts no token and sets `runAsUser: 1001`, the image's account `atlas`.
+Each inference Dockerfile adds that account to the `video` and `render` groups
+where the base image has them, for the GPU devices. On ROCm and Vulkan the
+compose overlays run llama-server as `ATLAS_LLAMA_USER` with the host's numbers
+for those two groups (`ATLAS_VIDEO_GID`, `ATLAS_RENDER_GID`): a name resolves in
+the image, and the device nodes belong to the host's numbers.
+
+The inference images declare no `USER`, so whoever starts one chooses the account,
+and a bare `docker run` is root. A compose file from before 3.2.0 sets no user
+for llama-server: with a `USER` in the image, that stack could not read its token
+and would run with internal auth off.
 
 Application files stay root-owned and world-readable (the `COPY`
 default), so the account can read them but not modify the image

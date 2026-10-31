@@ -24,8 +24,8 @@ docker compose logs --tail 50
 | NVIDIA CUDA | `nvidia-smi` |
 | AMD ROCm | `rocm-smi` を実行し、`/dev/kfd` が存在することを確認します。 |
 | Apple Silicon / Metal | `atlas doctor` を実行します。ネイティブサーバーが待ち受けていない場合は、[SETUP_MACOS.md](../../SETUP_MACOS.md#troubleshooting) の説明に従って `./scripts/atlas-llama-macos.sh` を起動し、フォアグラウンドのランチャー出力を確認します。 |
-| Vulkan | `/dev/dri` が存在することを確認し、`docker compose -f docker-compose.yml -f docker-compose.vulkan.yml exec llama-server vulkaninfo --summary` を実行します。 |
-| CPU のみ | `docker-compose.vulkan.yml` と `docker-compose.cpu.yml` のオーバーレイが有効であることを確認します。GPU がないことだけを理由に `atlas doctor` が失敗するのではなく、警告を出して正常終了するはずです。 |
+| Vulkan | `/dev/dri` が存在することを確認し、`docker compose -f docker-compose.yml -f compose/docker-compose.vulkan.yml exec llama-server vulkaninfo --summary` を実行します。 |
+| CPU のみ | `compose/docker-compose.vulkan.yml` と `compose/docker-compose.cpu.yml` のオーバーレイが有効であることを確認します。GPU がないことだけを理由に `atlas doctor` が失敗するのではなく、警告を出して正常終了するはずです。 |
 
 サービスごとのヘルスチェック curl は [SETUP.md § インストールの確認](./SETUP.md#インストールの確認) を参照してください。トリアージには atlas-proxy のヘルスエンドポイントがもっとも有用です — すべての上流サービスのステータスを報告します:
 ```json
@@ -265,10 +265,10 @@ compose オーバーライド経由でコンテナ環境に伝播するよう、
 
 ```bash
 echo "ATLAS_HSA_OVERRIDE_GFX_VERSION=10.3.0" >> .env
-docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d --force-recreate llama-server
+docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml up -d --force-recreate llama-server
 ```
 
-以前は非対応だったカードでこれが動いた場合は、ぜひ [GH #26](https://github.com/inferstep/ATLAS/issues/26) にメモを残してください — コミュニティ検証済みのオーバーライドは次のリリースのドキュメントに反映されます。
+以前は非対応だったカードでこれが動いた場合は、ぜひ [Hardware reports](https://github.com/inferstep/ATLAS/discussions/categories/hardware-reports) にメモを残してください — コミュニティ検証済みのオーバーライドは次のリリースのドキュメントに反映されます。
 
 ### RDNA4 (RX 9070 / 9070 XT, gfx1200 / gfx1201) — ROCm 7.x が必要
 
@@ -287,15 +287,15 @@ ATLAS_GFX_TARGET=gfx1201   # gfx1200 for RX 9070, gfx1201 for RX 9070 XT
 その後、再ビルドしてスタックを立ち上げます:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.rocm.yml build llama-server
-docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
+docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml build llama-server
+docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml up -d
 ```
 
 **重要: gfx1200/gfx1201 では `ATLAS_HSA_OVERRIDE_GFX_VERSION` を設定しないでください。** ROCm 7.0+ はこれらのターゲットをネイティブにサポートします。Docker 内で GFX バージョンをオーバーライドすると、コンパイル済みカーネルとランタイムターゲットの不一致が生じ、クラッシュにつながります。`ATLAS_HSA_OVERRIDE_GFX_VERSION` は未設定（デフォルト）のままにしてください。
 
 ### ROCm コンテナが `rocm/rocm-terminal` を取得できない
 
-**症状:** `atlas doctor` の ROCm チェックがイメージ取得でタイムアウトする。または `docker compose -f ... -f docker-compose.rocm.yml pull` が `llama-server` のビルドで失敗する。
+**症状:** `atlas doctor` の ROCm チェックがイメージ取得でタイムアウトする。または `docker compose -f ... -f compose/docker-compose.rocm.yml pull` が `llama-server` のビルドで失敗する。
 
 **意味:** ROCm イメージは大きく（約 2 GB）、Docker Hub は匿名の取得をレート制限しています。
 
@@ -309,7 +309,7 @@ docker pull rocm/rocm-terminal:latest
 doctor の ROCm チェックは常に `rocm/rocm-terminal:latest` を使用します。`ATLAS_ROCM_TAG` が固定するのは llama-server の ROCm ビルドの*ビルドベース*イメージ（`rocm/dev-ubuntu-*`）であって、doctor のチェック用イメージではありません:
 
 ```bash
-ATLAS_ROCM_TAG=6.2-complete docker compose -f docker-compose.yml -f docker-compose.rocm.yml build llama-server
+ATLAS_ROCM_TAG=6.2-complete docker compose -f docker-compose.yml -f compose/docker-compose.rocm.yml build llama-server
 ```
 
 ### 初回ビルドの失敗 (CUDA が見つからない)
@@ -486,7 +486,7 @@ docker compose logs llama-server | tail -20   # model loads, no CUDA errors
 curl -s localhost:8080/health                  # {"status":"ok"}
 ```
 
-**それでも失敗する場合:** コンテナが本当に再ビルドしたイメージを実行しているか確認してください（`docker compose images llama-server` — `docker compose pull` が上書きした可能性があります。`ATLAS_IMAGE_TAG` を固定するか、ビルドを再実行してください）。Pascal（`60`/`61`）以前は上流 llama.cpp の CUDA サポートの制約を受けます — Vulkan イメージ（`docker-compose.vulkan.yml`）がフォールバックです。それ以外の場合は、`nvidia-smi` の出力と llama-server ログの最初の 50 行を添えて Issue を作成してください。
+**それでも失敗する場合:** コンテナが本当に再ビルドしたイメージを実行しているか確認してください（`docker compose images llama-server` — `docker compose pull` が上書きした可能性があります。`ATLAS_IMAGE_TAG` を固定するか、ビルドを再実行してください）。Pascal（`60`/`61`）以前は上流 llama.cpp の CUDA サポートの制約を受けます — Vulkan イメージ（`compose/docker-compose.vulkan.yml`）がフォールバックです。それ以外の場合は、`nvidia-smi` の出力と llama-server ログの最初の 50 行を添えて Issue を作成してください。
 
 ### モデルが GPU ではなく CPU で読み込まれている
 
@@ -575,6 +575,7 @@ nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -I{} kill {}
 **修正:** プロキシは `/v1/agent` エージェントループハンドラ内で自動的に `response_format` を設定します。その形状は `ATLAS_GRAMMAR_MODE` が選びます: デフォルトの `strict` は `{"type":"json_object","schema":<full tool-call schema>}` を送信し、llama-server の GBNF サンプラーは tool_call/text/done のユニオンしか発行できなくなります。`ATLAS_GRAMMAR_MODE=loose` は `{"type":"json_object"}` のみを送信します（有効な JSON にはなるが形状は強制されない）— スキーマから GBNF への変換をうまく扱えないモデル向けの逃げ道です（Gemma 系モデルには `loose` が必要です — strict モードでは done を連発するようになります）。llama-server を `/v1/chat/completions` または `/v1/completions` で直接呼び出す場合は、パラメータを自分で含める必要があります:
 ```bash
 curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $(cat secrets/service-token)" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "local-model",
@@ -694,7 +695,7 @@ ATLAS_FRESH_SLOT_PER_SESSION=0
 
 **どうするか:** 欠けているファイルを `read_file` で読み、プロジェクトコンテキストに載せてください。サンドボックスの `/execute` API を直接呼んでいる場合は、リクエストボディで補助ファイルを渡してください:
 ```bash
-curl -X POST http://localhost:30820/execute -d '{
+curl -X POST http://localhost:30820/execute -H "Authorization: Bearer $(cat secrets/service-token)" -d '{
   "code": "from utils import greet\nprint(greet(\"x\"))",
   "language": "python",
   "files": {"utils.py": "def greet(n): return f\"hi {n}\""}
@@ -808,7 +809,7 @@ curl -s http://localhost:8099/health | python3 -m json.tool | grep -A2 fingerpri
 **修正:**
 1. エンベディングサーバーの規約を確認します。プーリング済み + 正規化済みのサーバーは ‖v‖≈1 のフラットなベクトルを返します:
    ```bash
-   curl -s -X POST http://localhost:8080/embedding -H 'Content-Type: application/json' \
+   curl -s -X POST http://localhost:8080/embedding -H "Authorization: Bearer $(cat secrets/service-token)" -H 'Content-Type: application/json' \
      -d '{"content":"def add(a, b): return a + b","embd_normalize":-1}' | python3 -c "import sys,json,math; e=json.load(sys.stdin)[0]['embedding']; import itertools; v=e if not isinstance(e[0],list) else [sum(c)/len(e) for c in zip(*e)]; print('shape', 'per_token' if isinstance(e[0],list) else 'flat', 'norm', round(math.sqrt(sum(x*x for x in v)),3))"
    ```
    プールされた `norm` は数百の範囲になります（同梱の Gemma アーティファクトでおよそ 100-150）。`norm` がちょうど `1.0` の場合、`embd_normalize: -1` を指定したにもかかわらずサーバーがベクトルを正規化しており、C(x) はどの入力に対しても約 0.8 という平坦な値を返します。健全に見えて何も区別しないスコアです。
@@ -825,6 +826,7 @@ curl -s http://localhost:8099/health | python3 -m json.tool | grep -A2 fingerpri
 ```bash
 # Test the native embedding endpoint directly
 curl -s http://localhost:8080/embedding \
+  -H "Authorization: Bearer $(cat secrets/service-token)" \
   -H "Content-Type: application/json" \
   -d '{"content": "test"}' | python3 -m json.tool
 ```

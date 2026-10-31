@@ -111,9 +111,6 @@ SCHEMA: Dict[str, Field] = {
     "ATLAS_HSA_OVERRIDE_GFX_VERSION": Field("str"),
     "ATLAS_UBUNTU_TAG": Field("str"),
     "ATLAS_VK_DEVICE_SELECT": Field("str"),
-    # Opt-in for loading the legacy pickled G(x) artifact (gx_xgboost.pkl);
-    # the lens refuses to unpickle by default — see CONFIGURATION.md.
-    "ATLAS_ALLOW_PICKLE_GX": Field("bool"),
     "ATLAS_SERVICE_TOKEN_FILE": Field("str"),
     "ATLAS_ALLOW_CREDENTIAL_READS": Field("bool"),
     "ATLAS_CONFIG_SCHEMA_VERSION": Field("int", min=1),
@@ -131,6 +128,9 @@ SCHEMA: Dict[str, Field] = {
     "ATLAS_GPU_VENDOR": Field("str"),
     "ATLAS_PROXY_UID": Field("int", min=0),
     "ATLAS_PROXY_GID": Field("int", min=0),
+    "ATLAS_VIDEO_GID": Field("str"),
+    "ATLAS_RENDER_GID": Field("str"),
+    "ATLAS_LLAMA_USER": Field("str"),
     # ASA control-vector path (entrypoint-v3.1.sh + `atlas asa`); the
     # _SCALE/_LAYER_RANGE/_ALLOW_UNVERIFIED tuning knobs are above.
     "ATLAS_CONTROL_VECTOR": Field("str"),
@@ -172,6 +172,8 @@ SCHEMA: Dict[str, Field] = {
         deprecated="removed; one delivery rule, not selectable — see docs/CANDIDATE_POLICY.md"),
     "ATLAS_CALL_GRAPH": Field("bool",
         deprecated="removed; the call graph always runs, for Python files"),
+    "ATLAS_ALLOW_PICKLE_GX": Field("bool",
+        deprecated="removed; the lens loads G(x) from gx_xgboost.json only"),
 }
 
 

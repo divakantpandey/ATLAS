@@ -6,8 +6,8 @@ issue.
 
 **Quick links:** [Start Here](https://github.com/orgs/inferstep/projects/1/views/1) (issues ready for newcomers) ·
 [Roadmap board](https://github.com/orgs/inferstep/projects/1) ·
-[ARCHITECTURE](docs/ARCHITECTURE.md) · [MAP](docs/MAP.md) ·
-[DEVELOPMENT](docs/DEVELOPMENT.md) · [GOVERNANCE](GOVERNANCE.md) ·
+[ARCHITECTURE](docs/ARCHITECTURE.md) · [MAP](docs/README.md#repository-map) ·
+[Development workflow](#development-workflow) · [GOVERNANCE](docs/GOVERNANCE.md) ·
 [Security reports](SECURITY.md)
 
 ## 1. How ATLAS is organized
@@ -16,7 +16,7 @@ ATLAS is a local coding agent made of a few services: the Go agent loop
 (`proxy/`), the terminal client (`tui/`), the Python CLI (`atlas/`), the V3
 candidate pipeline (`v3-service/`), the Geometric Lens (`geometric-lens/`),
 the sandbox (`sandbox/`) and the llama.cpp images (`inference/`).
-[MAP.md](docs/MAP.md) says what every directory owns, and
+[The repository map](docs/README.md#repository-map) says what every directory owns, and
 [ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how the pieces work
 together.
 
@@ -32,7 +32,7 @@ candidate, and `staging` to `main` as a release. See
   issue, or send a pull request.
 - **Hardware reports.** Run ATLAS on your GPU and report what happened,
   with your `atlas doctor` output. AMD (ROCm), Apple Silicon (Metal) and
-  Vulkan reports help most; see [SUPPORT_MATRIX](SUPPORT_MATRIX.md).
+  Vulkan reports help most; see [SUPPORT_MATRIX](docs/SUPPORT_MATRIX.md).
 - **Trained artifacts** for a new model (see below).
 - **Questions** go to [Discussions Q&A](https://github.com/inferstep/ATLAS/discussions/categories/q-a).
 
@@ -72,7 +72,7 @@ python scripts/production-readiness.py
 ```
 
 **With a GPU.** Install the full stack with [SETUP.md](docs/SETUP.md). Then
-use the dev mode in [DEVELOPMENT.md](docs/DEVELOPMENT.md), which runs your
+use the dev mode in [Development workflow](#development-workflow), which runs your
 working tree in the containers without a rebuild after every edit.
 
 ## 4. Run the quality gate
@@ -110,7 +110,7 @@ ATLAS_COVERAGE_DIR=coverage python scripts/production-readiness.py --only python
 CI sends its coverage reports to [Codecov](https://app.codecov.io/gh/inferstep/ATLAS).
 On a pull request it adds two statuses: the coverage of the whole project,
 and of the lines you changed. They show numbers and do not fail the pull
-request. Codecov does not comment. A branch that does not have `codecov.yml`
+request. Codecov does not comment. A branch that does not have `.github/codecov.yml`
 yet uploads nothing; update it from `dev`.
 
 CI also runs the SonarQube Cloud analysis (`sonar-project.properties`), and
@@ -126,7 +126,7 @@ shows every Ready issue. The board's fields mean:
 
 | Field | Meaning |
 |---|---|
-| Status | Triage → Needs Design → Backlog → **Ready** → In Progress → In Review → Done. Only Ready issues can be claimed. |
+| Status | Triage → Needs Design → Backlog → **Ready** → In Progress → In Review → Done, and Blocked at any step. Only Ready issues can be claimed. |
 | Priority | P0 is most urgent, P3 least |
 | Size | XS (under an hour) to XL (more than a week) |
 | Contributor Level | Starter, Intermediate, Advanced, Maintainer-only |
@@ -193,8 +193,9 @@ the hardware you ran it on (or "untested on hardware").
 
 Under **What users will notice**, say what a user of ATLAS sees differently
 after your change, in plain sentences or a list. If users notice nothing,
-write only "Nothing." The changelog of a release is made from that part, so
-a pull request does not edit `CHANGELOG.md`.
+write only "Nothing." The changelog of a release is made from that part. A pull
+request edits `CHANGELOG.md` only for a note a user must act on when upgrading,
+under `[Unreleased]`.
 
 GitHub sets **base** to `main` on a new pull request. Change it to `dev`
 before you click **Create pull request**.
@@ -302,7 +303,7 @@ Use the **RFC** issue form for architecture changes, new dependencies,
 security-model changes, release-policy or support-matrix changes, and any
 breaking change. An RFC gets a 7-day comment period and then a decision:
 Accepted, Revise, or Declined. An accepted RFC becomes an Epic with
-sub-issues. The whole flow is in [GOVERNANCE](GOVERNANCE.md#proposals-rfc--adr--epic).
+sub-issues. The whole flow is in [GOVERNANCE](docs/GOVERNANCE.md#proposals-rfc--adr--epic).
 
 ## 12. Getting help
 
@@ -317,7 +318,7 @@ Report security problems privately, never in an issue (see
 Access follows trust built over time, not a count of pull requests. The
 path is Contributor → Triager → Reviewer → Maintainer. Each rung has a
 minimum time, a nomination, and hard technical limits. See the
-[trust ladder](GOVERNANCE.md#trust-ladder).
+[trust ladder](docs/GOVERNANCE.md#trust-ladder).
 
 ## Code style
 
@@ -325,7 +326,7 @@ How code should read (size, structure, abstractions, comments) is in
 [CODE_STYLE.md](docs/CODE_STYLE.md). The rules per language:
 
 **Python.** PEP 8, type hints on function signatures, docstrings on public
-functions, lines up to 100 characters. `ruff` runs in the gate.
+functions, lines up to 100 characters. `ruff` runs in the gate; it does not check line length.
 
 **Go.** Format with `gofmt`. `go vet` and `staticcheck` run in the gate
 for `proxy/` and `tui/`.
@@ -430,6 +431,153 @@ its report short:
 python scripts/integrity_check.py                 # your branch against origin/dev
 python scripts/integrity_check.py --base <commit>
 ```
+
+## Development workflow
+
+Guide for contributors actively editing ATLAS source. The default
+`docker compose up -d` flow is geared at end users — it COPYs source
+into images at build time, so every code change requires a rebuild.
+This page documents the opt-in dev iteration mode that skips the
+rebuild loop.
+
+### When to use dev mode
+
+Use it when you are actively editing Python in `geometric-lens/` or
+`v3-service/`, or Go in `proxy/`. Skip it for one-off
+contributions where a single rebuild is acceptable.
+
+Dev mode does not change image behavior in production-like ways —
+it only short-circuits the COPY step in the Dockerfile by
+bind-mounting your working tree into the container.
+
+### Enabling dev mode (Python services)
+
+Compose merges `docker-compose.override.yml` automatically if the
+file exists. The repo ships `compose/docker-compose.override.yml.example` as
+a template:
+
+```bash
+cp compose/docker-compose.override.yml.example docker-compose.override.yml
+docker compose up -d
+```
+
+To turn dev mode off, delete the override file (or rename it) and
+re-run `docker compose up -d`. The override is git-ignored; commit
+changes to the `.example` file instead.
+
+#### geometric-lens
+
+The override bind-mounts `./geometric-lens` over `/app` and switches
+the command to `uvicorn ... --reload`. Editing any `.py` file under
+`geometric-lens/` reloads the worker within ~1 second; you do not
+need to restart the container.
+
+Verify the reloader is active:
+
+```bash
+docker compose logs geometric-lens | grep -i reload
+# expect: "Started reloader process ... using StatReload"
+```
+
+#### v3-service
+
+The override bind-mounts the `./v3-service/*.py` modules
+into the container (edit `v3-service/stages/` with a targeted rebuild —
+the stage package is COPY'd, not mounted). The service runs on Python's stdlib
+`http.server`, which has no built-in reloader, so after editing you
+need to restart the container — but no rebuild:
+
+```bash
+docker compose restart v3-service
+```
+
+Restart is ~1 second vs ~30 seconds for a rebuild.
+
+### atlas-proxy (Go)
+
+The proxy is **not** in the compose override. Its runtime image is
+alpine-based with no Go toolchain, so bind-mounting source would not
+recompile inside the container. Two viable options for iteration:
+
+#### Option A — run on host against the compose stack (recommended)
+
+Bring up the dependencies in compose, then stop only the proxy:
+
+```bash
+docker compose up -d
+docker compose stop atlas-proxy
+```
+
+Then run the proxy on the host, pointing it at the compose-exposed
+ports (the defaults work because each upstream service publishes its
+port to localhost):
+
+```bash
+cd proxy
+ATLAS_SERVICE_TOKEN_FILE=$(pwd)/../secrets/service-token \
+  ATLAS_PROXY_PORT=8090 \
+ATLAS_INFERENCE_URL=http://localhost:8080 \
+ATLAS_LLAMA_URL=http://localhost:8080 \
+ATLAS_LENS_URL=http://localhost:8099 \
+ATLAS_SANDBOX_URL=http://localhost:30820 \
+ATLAS_V3_URL=http://localhost:8070 \
+ATLAS_MODEL_NAME=local-model \
+ATLAS_WORKSPACE_DIR=$(pwd)/.. \
+go run .
+```
+
+The TUI (and any OpenAI-compat client) pointed at
+`http://localhost:8090` will hit the host process. Edits become live
+with a `Ctrl-C` + re-run. For auto-rebuild on save, install `air`
+(`go install github.com/air-verse/air@latest`) and run `air` in the
+same directory.
+
+When done, restart the container version:
+
+```bash
+docker compose up -d atlas-proxy
+```
+
+#### Option B — full container rebuild on each change
+
+If you only have a handful of Go edits, the targeted rebuild is
+fine:
+
+```bash
+docker compose up -d --build atlas-proxy
+```
+
+This is what users on `main` get, ~30-60s per cycle.
+
+### Other services
+
+`llama-server` and `sandbox` are not bind-mounted.
+
+- llama-server is a third-party binary — changes there are
+  Dockerfile / model-config changes, which need a rebuild anyway.
+- sandbox runs read-only on purpose; the override should not
+  weaken that. If you're editing the sandbox harness itself, do a
+  targeted rebuild: `docker compose up -d --build sandbox`.
+
+### Targeted rebuilds (no override needed)
+
+Even without dev mode, you can rebuild a single service rather than
+the full stack:
+
+```bash
+docker compose up -d --build geometric-lens
+docker compose up -d --build v3-service
+docker compose up -d --build atlas-proxy
+```
+
+This is the fallback whenever dev mode is off or doesn't apply
+(Dockerfile/dependency changes, requirements.txt edits, etc.).
+
+### Cross-references
+
+- `docs/SETUP.md` — first-time install.
+- `docs/CONFIGURATION.md` — env vars used by each service.
+- `docs/TROUBLESHOOTING.md` — runtime symptoms and fixes.
 
 ## License
 

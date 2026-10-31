@@ -48,9 +48,9 @@ llama-server は GPU を使用する唯一のサービスです。それ以外�
 | バックエンド | ステータス (V3.1.x) | イメージ / ビルドパス | Compose オーバーライド | 検証済みカード |
 |---|---|---|---|---|
 | **CUDA** (NVIDIA) | サポート対象 (Supported)（V3.1.0 以降） | `inference/Dockerfile.v31` → `atlas-llama` | (デフォルト) | RTX 5060 Ti 16GB（標準構成）。公開イメージは Blackwell（compute capability 12.0/12.1）のみを対象にコンパイルされており、それより前の世代はローカル再ビルドが必要 — [SETUP.md](../../SETUP.md) を参照 |
-| **ROCm / HIP** (AMD) | コミュニティ検証済み (Community-tested)（V3.1.1 以降） | `inference/Dockerfile.rocm` → `atlas-llama-rocm`、ホスト上でビルド（`pull_policy: build`; GHCR イメージなし） | `docker-compose.rocm.yml` | RX 7900 XTX（コミュニティによるスモークテスト、GH #26） |
-| **Metal** (Apple Silicon) | サポート対象 ([#32](https://github.com/inferstep/ATLAS/issues/32)) | ハイブリッド: ネイティブ llama-server (Metal) + 残りは Docker（macOS は GPU をコンテナにパススルーできないため） | `docker-compose.macos.yml` | M シリーズ; 16 GB 以下では Q4_K_M、24 GB 以上のユニファイドメモリでは Q6_K |
-| **Vulkan**（クロスベンダーフォールバック） | プレビュー (Preview) | `inference/Dockerfile.vulkan` → `atlas-llama-vulkan` | `docker-compose.vulkan.yml` | lavapipe の CPU 起動パス（スモークテスト済み）。実 GPU での検証はまだなし |
+| **ROCm / HIP** (AMD) | コミュニティ検証済み (Community-tested)（V3.1.1 以降） | `inference/Dockerfile.rocm` → `atlas-llama-rocm`、ホスト上でビルド（`pull_policy: build`; GHCR イメージなし） | `compose/docker-compose.rocm.yml` | RX 7900 XTX（コミュニティによるスモークテスト、GH #26） |
+| **Metal** (Apple Silicon) | サポート対象 ([#32](https://github.com/inferstep/ATLAS/issues/32)) | ハイブリッド: ネイティブ llama-server (Metal) + 残りは Docker（macOS は GPU をコンテナにパススルーできないため） | `compose/docker-compose.macos.yml` | M シリーズ; 16 GB 以下では Q4_K_M、24 GB 以上のユニファイドメモリでは Q6_K |
+| **Vulkan**（クロスベンダーフォールバック） | プレビュー (Preview) | `inference/Dockerfile.vulkan` → `atlas-llama-vulkan` | `compose/docker-compose.vulkan.yml` | lavapipe の CPU 起動パス（スモークテスト済み）。実 GPU での検証はまだなし |
 | **SYCL** (Intel Arc) | ロードマップ (Roadmap) — Intel Arc は現在 `vulkan` を使用 | 未定 | 未定 | — |
 
 **バックエンドの選択は実行時ではなくインストール時に行われます。** `atlas init` は `tier.detect_gpu()`（`atlas/commands/tier.py` を参照）を実行し、検出されたすべてのベンダーの中から VRAM が最大の GPU を選び（`ATLAS_GPU_VENDOR` / `ATLAS_GPU_INDEX` でオーバーライド可能）、`.env` に `ATLAS_BACKEND={cuda|rocm|metal|vulkan}` を書き込みます。パッケージ済みのネイティブバックエンドが存在する場合、検出はそれに解決されます: NVIDIA には CUDA、x86_64 上の AMD には ROCm、macOS にはハイブリッド Metal パス。ホスト向けのネイティブバックエンドがパッケージされていない場合（Intel Arc、arm64 上の AMD、未認識のベンダー）、ウィザードは Vulkan ユニバーサルフォールバックを提案します（デフォルトは yes）: 1 つのイメージで AMD、Intel、Adreno、MoltenVK、lavapipe CPU ラスタライザをカバーし、性能はチューニング済みのネイティブバックエンドよりおおよそ 20〜40% 低くなります。起動しない `.env` を書き込む代わりに拒否するのは、使えるものが何も存在しない場合だけです。各バックエンドにはそれぞれ事前ビルド済みのイメージがあります。ユーザーがすべてのバックエンドのライブラリを同梱した肥大化したイメージを実行することはありません。
@@ -65,7 +65,7 @@ llama-server は GPU を使用する唯一のサービスです。それ以外�
 - **マルチ GPU + テンソル並列。** V1 はすべてのバックエンドでシングル GPU のみをサポートします。マルチ GPU は GH #34 で、特定のベンダーに紐づいてはいません。
 - **Apple ユニファイドメモリ。** macOS は GPU とシステムメモリを共有します。「VRAM」の計算は実際には「合計 16 GB から OS + アプリを引いたもの」です。§7 を参照してください。
 
-K3s デプロイパス（`scripts/install.sh`、`templates/` 内のマニフェスト）は V3.1.1 時点では CUDA 専用です — ROCm の K8s レシピは V3.2 のインフラ項目に延期されています（`/dev/kfd` + `/dev/dri` の hostPath マウントと `render`/`video` グループ所属が必要で、これは `docker-compose.rocm.yml` のクラスターレベル相当です）。
+K3s デプロイパス（`scripts/install.sh`、`templates/` 内のマニフェスト）は V3.1.1 時点では CUDA 専用です — ROCm の K8s レシピは V3.2 のインフラ項目に延期されています（`/dev/kfd` + `/dev/dri` の hostPath マウントと `render`/`video` グループ所属が必要で、これは `compose/docker-compose.rocm.yml` のクラスターレベル相当です）。
 
 ---
 
@@ -92,7 +92,7 @@ K3s デプロイパス（`scripts/install.sh`、`templates/` 内のマニフェ�
 |---|---|
 | `main.go` | HTTP サーバー、ルーティング、認証、パススルー、エラーエンベロープ、秘匿値のログフィルタ |
 | `agent.go` | エージェントループ: ターン状態、LLM 呼び出し、プラン生成、スタックループのブレーカー |
-| `tools.go` | 16 個のツール定義 + 実行系、ティア分類、ツールコール文法 |
+| `tools.go`, `tool_*.go` | 16 個のツール定義 + 実行系、ティア分類、ツールコール文法 |
 | `gates*.go` | 誠実性 / プランゲート: クレームチェック、構造、構文、埋め込みスクリプト、プラン遵守、プランリマインダ、アセットリント |
 | `detectors.go` | スタックパターン検出: ツールの繰り返し、推論の繰り返し、トレースバックの局所化 |
 | `context.go` | コンテキストの拡充: シンボルインデックス、プロジェクトスキャン、ワークスペース封じ込め、セッションファイルマニフェスト |
@@ -316,7 +316,7 @@ run-first ゲート自体は1つの指示 `runFirstInstruction` を引用しま�
 計測を行ったリファレンスデプロイでは、`structural_edit` が正しい場合でも `structural_edit` より `edit_file` を優先するバイアスが観測されました（BiasBusters arxiv 2510.00307 — 近接するツール名の埋め込みが競合する; 名前よりも説明文の方が重要）。プロキシでは、モデルに依存しない4つの防御策を組み合わせます:
 
 1. **説明文の書き換え**（`proxy/tools.go`）。edit_file の説明はファイル全体/関数全体での使用を警告し、structural_edit の説明は >10 行 / ノード全体の差し替えには必須と述べ、write_file の説明は新規ファイル専用と述べる。
-2. **条件付き GBNF 文法**（`proxy/tools.go`、`proxy/agent.go:stepExclusions`）。既存の5行超 .py/.html/.htm ファイルに対する write_file が拒否されると、次の LLM 呼び出しはツール名のプロダクションから edit_file と write_file を禁止する GBNF 文法で制約される。モデルは物理的にそれらを発行できない。この制限は1回の判断後に失効する。
+2. **条件付き GBNF 文法**（`proxy/tool_schema.go`、`proxy/agent.go:stepExclusions`）。既存の5行超 .py/.html/.htm ファイルに対する write_file が拒否されると、次の LLM 呼び出しはツール名のプロダクションから edit_file と write_file を禁止する GBNF 文法で制約される。モデルは物理的にそれらを発行できない。この制限は1回の判断後に失効する。
 3. **ステップごとのツールリストフィルタ**（同じトリガー）。一時的な `[system note]` のユーザーメッセージが注入され、このステップでは structural_edit が唯一の構造的編集ツールであることをモデルに思い出させる。
 4. **ASA ステアリングベクトル**（`geometric-lens/asa_calibration/`）。活性化ステアリングが残差ストリームの分布を上流でシフトさせ、いかなる拒否が発火する前の初回の判断でも structural_edit が優先される。`inference/entrypoint-v3.1.sh` が `/models/ast_edit_steering.gguf` から自動ロードするのは、その `.model` サイドカーが選択中のモデルと一致する場合のみ — `geometric-lens/asa_calibration/README.md` のワークフローで互換性のあるビルドを行えば、以降は常時オン。パス/スケール/レイヤー範囲は `ATLAS_CONTROL_VECTOR*` 環境変数でオーバーライドする。
 

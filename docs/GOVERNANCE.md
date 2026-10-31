@@ -1,7 +1,7 @@
 # Governance
 
 ATLAS is a **single-maintainer project** today (see
-[MAINTAINERS.md](MAINTAINERS.md)). This document states how decisions
+[MAINTAINERS.md](../MAINTAINERS.md)). This document states how decisions
 are made now, how people gain access, and the limits that apply at every
 level. It does not pretend a committee exists.
 
@@ -44,7 +44,7 @@ are still the ones it writes.
   approval, and only maintainers can dismiss a review. An admin's own
   pull request merges without the approval, which is logged. The two
   branches move forward by the release step in
-  [docs/RELEASE.md](docs/RELEASE.md#the-release-step).
+  [docs/RELEASE.md](RELEASE.md#the-release-step).
 - **Branches.** Only admins, the `maintainers` team, and Dependabot can
   create, push or delete other branches. Everyone else works from a fork.
   Anyone with write access could otherwise push a branch with a new
@@ -55,7 +55,7 @@ are still the ones it writes.
   `maintainers` team can create, push or delete one. Dependabot and the
   repository's admin role cannot. The development server builds and runs
   the tip of such a branch
-  ([docs/quality/gates.md](docs/quality/gates.md#the-smoke-run-of-one-commit)),
+  ([docs/quality/gates.md](quality/gates.md#the-smoke-run-of-one-commit)),
   so no program may push one.
 - **Release tags** (`v*`). Only admins and maintainers can create one,
   and nobody can move or delete one once it exists.
@@ -88,7 +88,7 @@ earning maintainer trust, so every rung also has hard technical limits.
   owners: `.github/workflows/`, `scripts/`, `sandbox/`, `SECURITY.md`,
   `docs/RELEASE.md`, `docs/PUBLISHING.md` and
   `atlas/commands/model_registry.py` (see
-  [CODEOWNERS](.github/CODEOWNERS)).
+  [CODEOWNERS](../.github/CODEOWNERS)).
 - Only keys in `.github/allowed_signers` make valid release tags. The
   `production` environment, which moves `:latest` and version tags, needs
   the lead's approval.
@@ -117,21 +117,120 @@ RFCs are issues, so they sit on the same board as all other work.
 6. **Declined:** the issue is closed as not planned, with the reason, so
    the next person with the same idea finds it.
 
-ADR statuses and format are in [docs/adr/README.md](docs/adr/README.md).
+ADR statuses and format are in [docs/adr/README.md](adr/README.md).
 
 ## Review times
 
 - A maintainer responds to a pull request within **5 business days**.
 - New issues are triaged within **5 business days**; see
-  [TRIAGE.md](docs/TRIAGE.md).
-- Security reports follow the targets in [SECURITY.md](SECURITY.md).
+  [Triage](#triage).
+- Security reports follow the targets in [SECURITY.md](../SECURITY.md).
+
+## Triage
+
+How new issues become work someone can pick up. This is for triagers and
+maintainers (see the [trust ladder](#trust-ladder)).
+
+**When:** at least once a week. Every new issue gets a first response
+within **5 business days**.
+
+**Where:** the [Triage view](https://github.com/orgs/inferstep/projects/1/views/7)
+of the board. New issues and pull requests are added to it automatically
+with Status **Triage**, and issue forms add the `needs-triage` label.
+
+### For each new issue
+
+1. **Security?** If it describes a vulnerability, don't discuss the
+   details in public. Comment asking the reporter to use a
+   [private security advisory](https://github.com/inferstep/ATLAS/security/advisories/new),
+   and tell a maintainer, who hides or deletes the issue.
+2. **Duplicate?** Link the original, add `duplicate`, and close it as a
+   duplicate.
+3. **Enough information?** If not, ask for what's missing (for bugs,
+   usually the `atlas doctor` output and the logs) and add `needs-info`.
+   Close it as not planned after **14 days** without an answer. It can be
+   reopened any time.
+4. **Type.** Check the issue type: Bug, Feature, Task, Docs; Spike and Epic
+   for maintainers. A significant change needs an RFC (see
+   [Proposals](#proposals-rfc--adr--epic)).
+5. **Labels.** Add one or more `area/*` labels, and `platform/*` when it's
+   specific to a backend.
+6. **Board fields.** Priority, Size, Contributor Level, Hardware Needed,
+   and Critical Path. Set a milestone when it's targeted at a release.
+7. **Status.**
+   - **Needs Design**: an RFC or a decision is open.
+   - **Backlog**: wanted, but not specced yet.
+   - **Ready**: see the checklist below.
+   - Or close it as not planned (`wontfix`) with the reason.
+8. Remove `needs-triage`.
+
+Don't set `status/ready` or `status/blocked` by hand. The bot mirrors them
+from the board's Status every hour.
+
+### When a bug closes
+
+Set **Cause** in the text of the issue to one of the words of the bug form:
+a check was missing, checks ran in the wrong order, parsing, tool protocol,
+documentation, or other. The form sets it to "Not known yet" when the issue
+is opened. The causes of the closed bugs are what tells us which check to
+add next, so a cause is set also when the fix was small.
+
+### Ready means
+
+- [ ] Acceptance criteria are in the issue: what "done" looks like, and how
+      to check it
+- [ ] A **Shepherd** is set: the maintainer who answers questions on it
+- [ ] Size, Contributor Level and Hardware Needed are set
+- [ ] No open design question is left
+
+Only Ready issues can be claimed with `/claim`.
+
+### Priority
+
+| Priority | Use for |
+|---|---|
+| P0 | Broken install, data loss, or a security problem in a release. Drop everything. |
+| P1 | Should be in the next release |
+| P2 | Planned |
+| P3 | Some day |
+
+### Starter issues
+
+Keep 5 to 10 Starter issues in Ready, at least half of them needing no
+GPU. A good Starter issue is XS or S, has clear acceptance criteria and an
+available Shepherd, and needs little ATLAS-wide context. Also add the
+`good first issue` label, so GitHub lists it for newcomers.
+
+### Pull requests
+
+The bot adds `area/*` labels from the changed paths and welcomes
+first-time authors. Triagers check that a pull request links an issue and
+fills in the template. A maintainer approves CI runs for pull requests
+from outside the org, then reviews within 5 business days.
+
+### Every week
+
+- **Blocked view:** is each reason still true?
+- **`needs-info`:** close anything silent for 14 days.
+- **RFCs view:** ask a maintainer to decide on any RFC past its 7-day
+  comment period.
+- **Start Here:** keep enough Starter issues in it.
+
+### Every month
+
+Run `python scripts/setup/flow_review.py` and paste its output into a
+comment on the Project operations epic. It lists the Triage queue, outside
+pull requests and how long each waited for a first response, claims with
+no pull request, the Start Here stock, open alerts, and the OpenSSF
+Scorecard. It exits with 1 when an outside pull request has waited more
+than 5 business days, the time CONTRIBUTING promises.
 
 ## Release authority
 
 Maintainers can promote `dev` to `staging`. A stable release (`main`, a
 `vX.Y.Z` tag, `:latest`) needs the lead's approval in the `production`
 environment and a tag signed by a key in `allowed_signers`. The checklist
-is in [docs/RELEASE.md](docs/RELEASE.md). Today each promotion is a
+is in [docs/RELEASE.md](RELEASE.md). Today each promotion is a
 release step, which needs admin rights on the repository, so the lead
 runs it.
 
@@ -143,9 +242,9 @@ artifacts allow forks to continue.
 
 ## Security
 
-Security reports follow [SECURITY.md](SECURITY.md). What to do when
+Security reports follow [SECURITY.md](../SECURITY.md). What to do when
 something goes wrong (a vulnerability, a leaked key, a bad release) is in
-[INCIDENT_RESPONSE.md](docs/INCIDENT_RESPONSE.md). Security fixes may land
+[INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md). Security fixes may land
 ahead of the normal review flow, with the ADR or notes written
 afterwards.
 

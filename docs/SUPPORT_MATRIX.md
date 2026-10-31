@@ -32,7 +32,7 @@ Supported row cites its validation.
 | Rocky Linux 9 (RHEL-like) | amd64 | Supported | CI install matrix; maintainer dev box is EL9 |
 | Linux Mint / Pop!_OS (ID_LIKE ubuntu) | amd64 | Preview | Accepted by bootstrap with a warning; not separately tested |
 | macOS 14+ (Apple Silicon) | arm64 | Supported | Maintainer-verified on M2 Pro 32GB (hybrid Metal deployment) |
-| Linux | arm64 | Preview | llama-vulkan image is built multi-arch on releases; no end-to-end arm64 device validation yet (see § ARM64 scope) |
+| Linux | arm64 | Preview | llama-vulkan image is built multi-arch on releases; no end-to-end arm64 device validation yet (see [SETUP.md, arm64 hosts](SETUP.md#arm64-hosts-115)) |
 | Arch / openSUSE / Alpine / NixOS | any | Unsupported | Bootstrap refuses with a clear message |
 | Windows (incl. WSL) | any | Unsupported | Untested; no claims made |
 
@@ -61,7 +61,7 @@ and `atlas lens check` report against the installed bundle.
 | Registry ID | Level | Lens | ASA | Notes |
 |---|---|---|---|---|
 | Qwen3.5-9B-Q6_K | Supported | supported (uncalibrated legacy bundle) | supported (A/B-validated May 2026) | Reference model; hash-pinned public download |
-| gemma-4-12b-it-Q4_K_M | Preview | supported, uncalibrated: the published bundle is the legacy uncalibrated one (`lens_status` and `lens_calibrated` in [atlas/commands/model_registry.py](atlas/commands/model_registry.py)); re-publishing a calibrated bundle is a maintainer decision | Unverified (`asa_status` in [atlas/commands/model_registry.py](atlas/commands/model_registry.py)) — vector built, published, hash-pinned, and **on**: steering is always on, so `atlas model install-artifacts` writes its `.model` marker. Built from prompts that named the tool `ast_edit` (now `structural_edit`; [build_cvector_prompts.py](geometric-lens/asa_calibration/build_cvector_prompts.py)). Not Supported: no benefit is measured (see § Feature paths — ASA steering) | Manual GGUF download (Gemma ToU); artifacts hash-pinned |
+| gemma-4-12b-it-Q4_K_M | Preview | supported, uncalibrated: the published bundle is the legacy uncalibrated one (`lens_status` and `lens_calibrated` in [atlas/commands/model_registry.py](../atlas/commands/model_registry.py)); re-publishing a calibrated bundle is a maintainer decision | Unverified (`asa_status` in [atlas/commands/model_registry.py](../atlas/commands/model_registry.py)) — vector built, published, hash-pinned, and **on**: steering is always on, so `atlas model install-artifacts` writes its `.model` marker. Built from prompts that named the tool `ast_edit` (now `structural_edit`; [build_cvector_prompts.py](../geometric-lens/asa_calibration/build_cvector_prompts.py)). Not Supported: no benefit is measured (see § Feature paths — ASA steering) | Manual GGUF download (Gemma ToU); artifacts hash-pinned |
 | Qwen3.5-9B-Q4_K_M / Q8_0 | Preview | no-artifacts: the lens loads a bundle only for the exact model, so each quant needs its own (`atlas bench`, then `atlas lens build --from-results`) | unverified (the Q6_K vector) | Hash-pinned public downloads |
 | Qwen3.5-7B / 14B / 32B | Preview | no-artifacts | no-artifacts | No download source: unsloth has no public GGUF repo of these sizes; a file of your own installs with `atlas model install --url`. Requests are refused until a lens bundle exists (`atlas lens build`): the lens is required (ADR 0011) |
 | Bring-your-own GGUF | Preview | Requires `atlas lens build` (per-model bundle) | Requires `atlas asa build` | Requests are refused until the model has its lens bundle (ADR 0011); `atlas bench` runs without one, to build it — see § Model contract |
@@ -109,9 +109,9 @@ Every bundle activated by `atlas lens build` auto-writes `provenance.json`:
 backbone + dim + quant + layer, dataset, training commit,
 hyperparameters, seed, train/val split, validation metrics,
 normalization + thresholds, creation time, and SHA-256 of every artifact
-file. `geometric_lens.provenance.is_complete()` gates Supported
-eligibility — a bundle missing required fields stays Preview/Legacy
-rather than silently claiming Supported. The gemma reference bundle
+file. `geometric_lens.provenance.is_complete()` says whether a bundle has every
+required field. No product code calls it yet, so it does not gate Supported
+status. The gemma reference bundle
 carries a complete manifest (val AUC 0.73, all seven files hashed).
 
 ### Model contract
@@ -148,9 +148,9 @@ timeouts/output caps; **syntax** = compile/parse check only.
 |---|---|---|
 | Python 3 | executed + self-tests | Supported |
 | JavaScript / TypeScript (node, tsx) | executed | Supported |
-| Go | executed | Supported |
-| Rust | executed | Supported |
-| C / C++ | executed (gcc/g++) | Supported |
+| Go | executed by `run_command` in the project; V3 checks syntax, and `/execute` only compiles ([#163](https://github.com/inferstep/ATLAS/issues/163)) | Supported |
+| Rust | executed by `run_command` in the project; V3 checks syntax, and `/execute` only compiles ([#163](https://github.com/inferstep/ATLAS/issues/163)) | Supported |
+| C / C++ | executed (gcc/g++) by `run_command` in the project; V3 checks syntax, and `/execute` only compiles ([#163](https://github.com/inferstep/ATLAS/issues/163)) | Supported |
 | Bash / sh | executed | Supported |
 | HTML / XML / JSON / YAML | syntax | Supported |
 | Java | executed | Preview (installed in default sandbox; CI smoke test containerized; host-runner tests skipif-gated) |
@@ -165,11 +165,11 @@ timeouts/output caps; **syntax** = compile/parse check only.
 | Direct agent (tools, permissions, sandbox verify) | Supported | Deterministic E2E in CI + unit/contract suites |
 | V3 pipeline (probe → candidates → selection) | Supported (control plane) / Preview (per-model quality) | Deterministic V3/Lens E2E in CI; real-model quality validated on the reference model only |
 | Lens C(x)/G(x) scoring | Supported (contract) / per-model calibration required for interventions | Identity + dim checks enforced; calibration status surfaced everywhere |
-| ASA steering | Always on wherever a vector is installed for the served model ([inference/entrypoint-v3.1.sh](inference/entrypoint-v3.1.sh) applies it at start). Supported on Qwen3.5-9B-Q6_K; unverified on gemma | Each model's status is its `asa_status` in [atlas/commands/model_registry.py](atlas/commands/model_registry.py). On gemma, no benefit is measured, and whole-task outcomes were not measured |
+| ASA steering | Always on wherever a vector is installed for the served model ([inference/entrypoint-v3.1.sh](../inference/entrypoint-v3.1.sh) applies it at start). Supported on Qwen3.5-9B-Q6_K; unverified on gemma | Each model's status is its `asa_status` in [atlas/commands/model_registry.py](../atlas/commands/model_registry.py). On gemma, no benefit is measured, and whole-task outcomes were not measured |
 | Call-graph reasoning (#39) | Preview | Always on, Python files only (the veto, repair context and read/outline edges); hermetic tests; effect on task outcomes not yet measured |
 | Host verification (`ATLAS_VERIFY_IN=host`) | Experimental | Explicit opt-in; removes the container backstop |
 | Benchmark/ablation stack (`ATLAS_V3_*`, lens feedback) | Research-only | Never read by the product runtime (contract-tested) |
-| IDE integration | Preview (VS Code and JetBrains) | VS Code: type-check, lint, unit suite and production bundle in `vscode-extension.yml`; no on-screen acceptance run against a live proxy. JetBrains: Plugin Verifier on IDEA, PyCharm, WebStorm and GoLand (2026.1.5 and 2026.2.3); no on-screen acceptance run against a live proxy yet |
+| IDE integration | Preview on `dev`, not in 3.1.7 (VS Code and JetBrains) | VS Code: type-check, lint, unit suite and production bundle in `vscode-extension.yml`; no on-screen acceptance run against a live proxy. JetBrains: Plugin Verifier on IDEA, PyCharm, WebStorm and GoLand (2026.1.5 and 2026.2.3); no on-screen acceptance run against a live proxy yet |
 
 ## Context lengths
 
@@ -198,7 +198,7 @@ fails fast at llama-server startup (fit is off).
 - **HTTP/SSE protocol:** additive event types are non-breaking (clients
   drop unknown types — the TUI does); field removals or renames require
   a major version and one release of deprecation notice.
-- **Python:** ≥3.9 (CLI), 3.13 (sandbox), 3.11 (proxy/lens/v3 containers), CI runs 3.12.
+- **Python:** ≥3.9 (CLI), 3.13 (sandbox and V3 containers), 3.11 (lens container), CI runs 3.12. The proxy is Go.
   **Go:** proxy 1.24+, TUI 1.26+ (GOTOOLCHAIN auto-fetch).
 - **Docker:** Engine 24+ with Compose v2. **llama.cpp:** pinned by
   revision in all inference Dockerfiles; bumps go through the CI

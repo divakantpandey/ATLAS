@@ -16,10 +16,10 @@ ROOT = Path(__file__).resolve().parents[2]
 # actually merged onto the base file.
 COMPOSE_COMBINATIONS = [
     ("docker-compose.yml",),
-    ("docker-compose.yml", "docker-compose.rocm.yml"),
-    ("docker-compose.yml", "docker-compose.vulkan.yml"),
-    ("docker-compose.yml", "docker-compose.vulkan.yml", "docker-compose.cpu.yml"),
-    ("docker-compose.yml", "docker-compose.macos.yml"),
+    ("docker-compose.yml", "compose/docker-compose.rocm.yml"),
+    ("docker-compose.yml", "compose/docker-compose.vulkan.yml"),
+    ("docker-compose.yml", "compose/docker-compose.vulkan.yml", "compose/docker-compose.cpu.yml"),
+    ("docker-compose.yml", "compose/docker-compose.macos.yml"),
 ]
 
 
@@ -84,6 +84,28 @@ def test_the_services_that_read_the_token_run_as_the_installing_user(service):
     proxy = services["atlas-proxy"]["user"]
     assert proxy == "${ATLAS_PROXY_UID:-1000}:${ATLAS_PROXY_GID:-1000}"
     assert services[service]["user"] == (proxy if service != "sandbox" else proxy.replace("PROXY", "SANDBOX"))
+
+
+@pytest.mark.parametrize("overlay", ["compose/docker-compose.rocm.yml", "compose/docker-compose.vulkan.yml"])
+def test_the_gpu_overlays_take_the_host_group_numbers(overlay):
+    # A name in group_add resolves in the image, and the device nodes belong
+    # to the host's numbers. Read as text: these files use compose's !reset.
+    text = (ROOT / overlay).read_text()
+    assert "- ${ATLAS_VIDEO_GID:-video}\n      - ${ATLAS_RENDER_GID:-render}\n" in text
+
+
+@pytest.mark.parametrize("overlay", ["compose/docker-compose.rocm.yml", "compose/docker-compose.vulkan.yml"])
+def test_the_gpu_overlays_keep_root_until_the_user_is_written(overlay):
+    # A .env from before 3.2.0 has no group numbers, and a non-root account
+    # would lose the GPU.
+    assert 'user: "${ATLAS_LLAMA_USER:-0:0}"' in (ROOT / overlay).read_text()
+
+
+def test_the_cpu_stack_runs_as_the_installing_user():
+    # It layers on the Vulkan overlay. A !reset would leave no user, and the
+    # image declares none, so this must name the account.
+    text = (ROOT / "compose" / "docker-compose.cpu.yml").read_text()
+    assert 'user: "${ATLAS_PROXY_UID:-1000}:${ATLAS_PROXY_GID:-1000}"' in text
 
 
 @pytest.mark.parametrize("service", ["geometric-lens", "v3-service"])

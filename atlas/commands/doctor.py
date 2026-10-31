@@ -542,7 +542,7 @@ def check_health_endpoints() -> List[CheckResult]:
 def _services_cannot_read(path: str) -> Optional[str]:
     """Why the services cannot read the token file, or None when they can.
 
-    docker-compose.yml runs the lens, V3 and the proxy as ATLAS_PROXY_UID and
+    docker-compose.yml runs llama-server, the lens, V3 and the proxy as ATLAS_PROXY_UID and
     the sandbox as ATLAS_SANDBOX_UID; `atlas init` sets both to the installing
     user, whose file (0600, in a 0700 folder) it is. Each service stops when
     it cannot read the file. Linux only: other hosts map file owners into
@@ -601,7 +601,7 @@ def _probe_service_auth(name: str, method: str, url: str, body: Optional[dict], 
         return CheckResult(check, "skip", f"token present; enforcement probe skipped ({type(e).__name__})")
     if wrong != 401:
         return CheckResult(check, "warn", f"token file present but the {name} accepts wrong tokens",
-                           f"the {name} container predates the token or lacks the secrets mount — docker compose up -d")
+                           f"the {name} container predates the token or lacks the secrets mount — docker compose up -d --force-recreate")
     if right == 401:
         return CheckResult(check, "fail", f"host token rejected by the {name} (rotation without restart?)",
                            "docker compose restart  # services reload the token")
