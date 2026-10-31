@@ -418,11 +418,12 @@ def test_self_check_detects_permission_denied_on_proc(monkeypatch):
     assert reason == rc.SUPERVISION_UNAVAILABLE_REASON
 
 
-def test_health_reports_degraded_state_when_supervision_unavailable(monkeypatch):
+def test_health_reports_degraded_state_when_supervision_unavailable(monkeypatch, tmp_path):
     """The /health endpoint and execution results report when resource limits are not enforced."""
     monkeypatch.syspath_prepend(SANDBOX)
     import executor_server as ex
 
+    monkeypatch.setattr(ex, "WORKSPACE_BASE", tmp_path)
     monkeypatch.setattr(ex, "SUPERVISION_AVAILABLE", False)
     monkeypatch.setattr(ex, "SUPERVISION_REASON", rc.SUPERVISION_UNAVAILABLE_REASON)
 
@@ -436,12 +437,17 @@ def test_health_reports_degraded_state_when_supervision_unavailable(monkeypatch)
     assert res["limits_enforced"] is False
     assert res["resource_limits"] == "resource limits not enforced"
 
+    exec_res = ex.execute_code(ex.ExecuteRequest(code="echo ok\n", language="bash", timeout=5))
+    assert exec_res.limits_enforced is False
+    assert exec_res.resource_limits == "resource limits not enforced"
 
-def test_health_reports_enforced_state_when_supervision_available(monkeypatch):
+
+def test_health_reports_enforced_state_when_supervision_available(monkeypatch, tmp_path):
     """The /health endpoint and execution results report when resource limits are enforced."""
     monkeypatch.syspath_prepend(SANDBOX)
     import executor_server as ex
 
+    monkeypatch.setattr(ex, "WORKSPACE_BASE", tmp_path)
     monkeypatch.setattr(ex, "SUPERVISION_AVAILABLE", True)
     monkeypatch.setattr(ex, "SUPERVISION_REASON", "enforced")
 
@@ -454,3 +460,7 @@ def test_health_reports_enforced_state_when_supervision_available(monkeypatch):
     res = ex._run_cmd(["bash", "-c", "echo ok"], timeout=5)
     assert res["limits_enforced"] is True
     assert res["resource_limits"] == "enforced"
+
+    exec_res = ex.execute_code(ex.ExecuteRequest(code="echo ok\n", language="bash", timeout=5))
+    assert exec_res.limits_enforced is True
+    assert exec_res.resource_limits == "enforced"

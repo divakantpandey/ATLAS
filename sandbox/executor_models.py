@@ -43,7 +43,7 @@ class ExecuteResponse(BaseModel):
     timed_out: bool = False
     outcome: str = OUTCOME_COMPLETED
     limits_enforced: bool = True
-    resource_limits: Optional[str] = None
+    resource_limits: Optional[str] = "enforced"
 
 
 class SyntaxCheckRequest(BaseModel):

@@ -559,7 +559,7 @@ Run all services as local processes without containers. Useful for development o
 | **llama.cpp** | Built from source with CUDA (see [llama.cpp build instructions](https://github.com/ggml-org/llama.cpp?tab=readme-ov-file#build)) |
 | **Node.js 20+** | Required by sandbox for JavaScript/TypeScript execution |
 | **Rust** | Required by sandbox for Rust execution |
-| **Linux with /proc** | Required for sandbox memory/process limits (`/proc/<pid>/stat`, `environ`); without `/proc`, only wall-clock timeouts apply |
+| **Linux with /proc** | Required for sandbox process-group memory and process-count limits and cleanup of escaped processes (`/proc/<pid>/stat`, `environ`); without `/proc`, only wall-clock timeouts and per-process address-space ceilings (`setrlimit`) apply |
 
 ### Build
 

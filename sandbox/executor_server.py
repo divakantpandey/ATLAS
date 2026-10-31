@@ -1080,9 +1080,9 @@ def execute_code(request: ExecuteRequest):
             requirements=request.requirements,
             stdin=request.stdin,
         )
-        if not SUPERVISION_AVAILABLE:
-            result.limits_enforced = False
-            result.resource_limits = "resource limits not enforced"
+        result.limits_enforced = SUPERVISION_AVAILABLE
+        result.resource_limits = (
+            "enforced" if SUPERVISION_AVAILABLE else "resource limits not enforced")
         return result
     except Exception as e:
         logger.exception(f"Execution error for {lang}")
